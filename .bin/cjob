@@ -1,0 +1,2347 @@
+#!/usr/bin/env python3
+"""cjob — administer local scheduled Claude Code jobs (launchd, macOS).
+
+Run with no arguments for an interactive REPL; `cjob <command> ...` runs a
+single command and exits with a meaningful status code.
+
+Python 3 stdlib only — no pip installs.
+"""
+
+import cmd
+import datetime
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+try:
+    import readline  # noqa: F401  (history + completion in the REPL)
+except ImportError:  # pragma: no cover
+    readline = None
+
+HOME = "/Users/abi"
+JOBS_ROOT = os.path.join(HOME, "claude-jobs")
+# Every job (agent) lives under here. The whole dir is git-ignored, so job
+# names, prompts, logs and target repo paths never reach the public repo.
+AGENTS_DIR = os.path.join(JOBS_ROOT, ".agents")
+TEMPLATES = os.path.join(JOBS_ROOT, ".templates")
+CLI_STATE = os.path.join(JOBS_ROOT, ".state", "cjob.json")
+LAUNCH_AGENTS = os.path.join(HOME, "Library", "LaunchAgents")
+LABEL_PREFIX = "com.abi.claudejob."
+DEFAULT_TOKEN_FILE = os.path.join(HOME, ".secrets", "claude_oauth_token")
+DEFAULT_CLAUDE_BIN = os.path.join(HOME, ".local", "bin", "claude")
+DEFAULT_MODEL = "claude-sonnet-5"
+
+# Jiva — the second runner. "action execution" jobs, always --code mode (see
+# buildspec discussion at integration time): no permission-mode / cost-API /
+# workspace-boundary equivalents exist in Jiva today, so RUNNER=jiva jobs
+# carry a different, smaller CONFIG block (see CONFIG_KEYS_JIVA) and get
+# their own doctor checks rather than reusing Claude's.
+DEFAULT_JIVA_BIN = os.path.join(HOME, ".nvm", "versions", "node", "v24.18.0", "bin", "jiva")
+DEFAULT_JIVA_CONFIG_FILE = os.path.join(HOME, ".jiva", "config.json")
+DEFAULT_JIVA_PATH_EXTRA = os.path.join(HOME, ".nvm", "versions", "node", "v24.18.0", "bin")
+RUNNERS = ["claude", "jiva"]
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$")
+MODEL_ALIASES = {"opus", "sonnet", "haiku", "fable", "best", "opusplan"}
+PERMISSION_MODES = ["auto", "dontAsk", "acceptEdits", "bypassPermissions"]
+
+# Full IDs known to support auto mode, per buildspec §9.4.
+AUTO_SUPPORTED = {
+    "claude-opus-5", "claude-sonnet-5", "claude-fable-5",
+    "claude-opus-4-8", "claude-sonnet-4-8",
+    "claude-opus-4-6", "claude-sonnet-4-6",
+}
+
+FDA_HELP = (
+    "System Settings -> Privacy & Security -> Full Disk Access -> +\n"
+    "    then Cmd+Shift+G and enter:  /bin/bash\n"
+    "  The plist invokes /bin/bash, so the grant must be on /bin/bash itself."
+)
+
+
+# ─────────────────────────── output helpers ───────────────────────────
+
+_TTY = sys.stdout.isatty()
+
+
+def _c(code):
+    return (lambda s: "\033[%sm%s\033[0m" % (code, s)) if _TTY else (lambda s: str(s))
+
+
+bold = _c("1")
+dim = _c("2")
+red = _c("31")
+green = _c("32")
+yellow = _c("33")
+blue = _c("34")
+cyan = _c("36")
+
+
+def err(msg):
+    sys.stderr.write("%s %s\n" % (red("error:"), msg))
+
+
+def warn(msg):
+    print("%s %s" % (yellow("warn:"), msg))
+
+
+def table(rows, headers):
+    if not rows:
+        return
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(_plain(cell)))
+    line = "  ".join(bold(h.ljust(widths[i])) for i, h in enumerate(headers))
+    print(line)
+    print(dim("  ".join("-" * w for w in widths)))
+    for row in rows:
+        print("  ".join(_pad(c, widths[i]) for i, c in enumerate(row)))
+
+
+_ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def _plain(s):
+    return _ANSI.sub("", str(s))
+
+
+def _pad(s, width):
+    s = str(s)
+    return s + " " * max(0, width - len(_plain(s)))
+
+
+def _wrap_value(value, width=78):
+    """Break a long config value at commas so `show` stays readable."""
+    text = str(value)
+    if len(_plain(text)) <= width:
+        return [text]
+    chunks, current = [], ""
+    for part in text.split(","):
+        candidate = part if not current else current + "," + part
+        if len(candidate) > width and current:
+            chunks.append(current + ",")
+            current = part
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or [text]
+
+
+# ─────────────────────────── process helpers ──────────────────────────
+
+def run(argv, env=None, cwd=None, timeout=None):
+    """Never shell=True. Returns (rc, stdout, stderr)."""
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, env=env, cwd=cwd, timeout=timeout
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except FileNotFoundError:
+        return 127, "", "%s: command not found" % argv[0]
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out after %ss" % timeout
+
+
+def git_info(repo_dir):
+    if not os.path.isdir(repo_dir):
+        return None
+    rc, out, _ = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir)
+    if rc != 0:
+        return None
+    branch = out.strip()
+    _, sha, _ = run(["git", "rev-parse", "--short", "HEAD"], cwd=repo_dir)
+    _, status, _ = run(["git", "status", "--porcelain"], cwd=repo_dir)
+    return {"branch": branch, "sha": sha.strip(), "dirty": bool(status.strip())}
+
+
+# ─────────────────────────── run.sh config ────────────────────────────
+
+CONFIG_START = re.compile(r"^#\s*CONFIG\b")
+CONFIG_END = re.compile(r"^#\s*END CONFIG\b")
+ASSIGN = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
+
+CONFIG_KEYS = [
+    "JOB_NAME", "REPO_DIR", "EXTRA_DIRS", "MODEL", "PERMISSION_MODE",
+    "MAX_TURNS", "MAX_BUDGET_USD", "ALLOWED_TOOLS", "DISALLOWED_TOOLS",
+    "TIMEOUT_SECONDS", "LOG_RETENTION_DAYS", "PATH_EXTRA", "TOKEN_FILE",
+    "CLAUDE_BIN",
+]
+
+CONFIG_KEYS_JIVA = [
+    "JOB_NAME", "REPO_DIR", "JIVA_MAX_ITERATIONS", "JIVA_CONFIG_FILE",
+    "JIVA_DIRECTIVE_FILE", "JIVA_INPUT_PRICE_PER_1M", "JIVA_OUTPUT_PRICE_PER_1M",
+    "TIMEOUT_SECONDS", "LOG_RETENTION_DAYS", "PATH_EXTRA", "JIVA_BIN",
+]
+
+
+def config_keys_for(cfg_or_meta):
+    """Which CONFIG_KEYS list to show, based on the job's RUNNER."""
+    runner = cfg_or_meta.get("RUNNER") or cfg_or_meta.get("runner") or "claude"
+    return CONFIG_KEYS_JIVA if runner == "jiva" else CONFIG_KEYS
+
+
+def _split_value(text):
+    try:
+        parts = shlex.split(text, comments=True)
+    except ValueError:
+        parts = [text.strip()]
+    return parts
+
+
+def parse_run_sh(path):
+    """Parse the CONFIG block out of a run.sh. Source of truth is run.sh."""
+    cfg = {}
+    try:
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return cfg
+    inside = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not inside:
+            if CONFIG_START.match(stripped):
+                inside = True
+            i += 1
+            continue
+        if CONFIG_END.match(stripped):
+            break
+        m = ASSIGN.match(stripped)
+        if m:
+            key, rhs = m.group(1), m.group(2)
+            if rhs.lstrip().startswith("("):
+                buf = rhs.lstrip()[1:]
+                while ")" not in buf and i + 1 < len(lines):
+                    i += 1
+                    buf += " " + lines[i]
+                buf = buf.split(")", 1)[0]
+                cfg[key] = _split_value(buf)
+            else:
+                vals = _split_value(rhs)
+                cfg[key] = vals[0] if vals else ""
+        i += 1
+    return cfg
+
+
+def cfg_int(cfg, key, default=0):
+    try:
+        return int(str(cfg.get(key, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def cfg_num(cfg, key, default=0):
+    try:
+        v = float(str(cfg.get(key, default)).strip())
+        return int(v) if v == int(v) else v
+    except (TypeError, ValueError):
+        return default
+
+
+def auto_mode_supported(model):
+    """True / False / None (unknown model)."""
+    m = (model or "").strip()
+    if m in AUTO_SUPPORTED:
+        return True
+    if m in MODEL_ALIASES:
+        return None
+    if m.startswith("claude-fable-"):
+        return True
+    if m.startswith("claude-haiku"):
+        return False
+    mm = re.match(r"^claude-(opus|sonnet)-(\d+)(?:-(\d+))?", m)
+    if mm:
+        major = int(mm.group(2))
+        minor = int(mm.group(3) or 0)
+        if major >= 5:
+            return True
+        return (major, minor) >= (4, 6)
+    return None
+
+
+# ─────────────────────────── schedules ────────────────────────────────
+
+DAY_KEYS = {
+    "sun": 0, "sunday": 0, "mon": 1, "monday": 1, "tue": 2, "tues": 2,
+    "tuesday": 2, "wed": 3, "weds": 3, "wednesday": 3, "thu": 4, "thur": 4,
+    "thurs": 4, "thursday": 4, "fri": 5, "friday": 5, "sat": 6, "saturday": 6,
+}
+DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+SCHEDULE_HELP = (
+    "specs:  hourly | hourly :07 | daily 03:00 | daily 03:00,15:00 | "
+    "weekdays 09:30 | weekends 10:00 | mon,thu 07:00"
+)
+
+
+def _parse_times(text):
+    times = []
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        m = re.match(r"^(\d{1,2}):(\d{2})$", chunk)
+        if not m:
+            raise ValueError("bad time %r (want HH:MM)" % chunk)
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError("time out of range: %r" % chunk)
+        times.append((hour, minute))
+    if not times:
+        raise ValueError("no time given")
+    return times
+
+
+def parse_schedule(spec):
+    """-> (canonical_spec, [StartCalendarInterval dicts])"""
+    toks = (spec or "").strip().split()
+    if not toks:
+        raise ValueError("empty schedule. " + SCHEDULE_HELP)
+    when = toks[0].lower()
+    rest = "".join(toks[1:])
+
+    if when == "hourly":
+        minute = 0
+        if rest:
+            m = re.match(r"^:?(\d{1,2})$", rest)
+            if not m:
+                raise ValueError("hourly takes an optional minute, e.g. `hourly :07`")
+            minute = int(m.group(1))
+            if not 0 <= minute <= 59:
+                raise ValueError("minute out of range: %s" % minute)
+        canon = "hourly" if minute == 0 else "hourly :%02d" % minute
+        return canon, [{"Minute": minute}]
+
+    times = _parse_times(rest)
+    times_s = ",".join("%02d:%02d" % t for t in times)
+
+    if when == "daily":
+        return "daily %s" % times_s, [{"Hour": h, "Minute": m} for h, m in times]
+
+    if when == "weekdays":
+        days = [1, 2, 3, 4, 5]
+        canon_when = "weekdays"
+    elif when == "weekends":
+        days = [0, 6]
+        canon_when = "weekends"
+    else:
+        days = []
+        for part in when.split(","):
+            part = part.strip()
+            if part not in DAY_KEYS:
+                raise ValueError("unknown day %r. %s" % (part, SCHEDULE_HELP))
+            wd = DAY_KEYS[part]
+            if wd not in days:
+                days.append(wd)
+        if not days:
+            raise ValueError("no days given. " + SCHEDULE_HELP)
+        canon_when = ",".join(DAY_NAMES[d].lower() for d in sorted(days))
+
+    entries = [
+        {"Weekday": d, "Hour": h, "Minute": m}
+        for d in sorted(days) for h, m in times
+    ]
+    return "%s %s" % (canon_when, times_s), entries
+
+
+def describe_schedule(meta):
+    sched = (meta or {}).get("schedule") or {}
+    spec = sched.get("spec")
+    if not spec:
+        return dim("unscheduled")
+    if spec == "hourly":
+        return "hourly at :00"
+    return spec
+
+
+def render_calendar(entries):
+    def one(entry, indent):
+        pad = " " * indent
+        out = [pad + "<dict>"]
+        for key in ("Weekday", "Hour", "Minute"):
+            if key in entry:
+                out.append("%s  <key>%s</key><integer>%d</integer>"
+                           % (pad, key, entry[key]))
+        out.append(pad + "</dict>")
+        return out
+
+    if len(entries) == 1:
+        return "\n".join(one(entries[0], 2))
+    lines = ["  <array>"]
+    for entry in entries:
+        lines.extend(one(entry, 4))
+    lines.append("  </array>")
+    return "\n".join(lines)
+
+
+# ─────────────────────────── launchd ──────────────────────────────────
+
+DOMAIN = "gui/%d" % os.getuid()
+
+# Background services — cjob-web and its ngrok tunnel. Fixed singletons (not
+# per-job), so no template substitution needed; generated inline below.
+WEB_DIR = os.path.join(JOBS_ROOT, ".web")
+WEB_SERVER_JS = os.path.join(WEB_DIR, "server.js")
+WEB_LOGS_DIR = os.path.join(WEB_DIR, "logs")
+WEB_PORT = 3322
+NODE_BIN = "/usr/local/bin/node"
+NGROK_BIN = "/usr/local/bin/ngrok"
+WEB_LABEL = "com.abi.cjobweb"
+TUNNEL_LABEL = "com.abi.cjobtunnel"
+
+
+def launchctl(*args, **kw):
+    return run(["launchctl", *args], timeout=kw.get("timeout", 30))
+
+
+def agent_loaded(label):
+    rc, _, _ = launchctl("print", "%s/%s" % (DOMAIN, label))
+    return rc == 0
+
+
+# ─────────────────────────── job model ────────────────────────────────
+
+class Job:
+    def __init__(self, name):
+        self.name = name
+        self.dir = os.path.join(AGENTS_DIR, name)
+
+    # paths
+    @property
+    def run_sh(self):
+        return os.path.join(self.dir, "run.sh")
+
+    @property
+    def prompt(self):
+        return os.path.join(self.dir, "prompt.md")
+
+    @property
+    def job_json(self):
+        return os.path.join(self.dir, "job.json")
+
+    @property
+    def state_dir(self):
+        return os.path.join(self.dir, "state")
+
+    @property
+    def logs_dir(self):
+        return os.path.join(self.dir, "logs")
+
+    @property
+    def label(self):
+        return LABEL_PREFIX + self.name
+
+    @property
+    def plist(self):
+        return os.path.join(LAUNCH_AGENTS, self.label + ".plist")
+
+    # data
+    def config(self):
+        return parse_run_sh(self.run_sh)
+
+    def meta(self, sync=True):
+        meta = {}
+        try:
+            with open(self.job_json) as fh:
+                meta = json.load(fh)
+        except (OSError, ValueError):
+            meta = {}
+        if not sync:
+            return meta
+        cfg = self.config()
+        runner = cfg.get("RUNNER") or "claude"
+        if runner == "jiva":
+            derived = {
+                "name": self.name,
+                "runner": "jiva",
+                "repo_dir": cfg.get("REPO_DIR", ""),
+                "timeout_seconds": cfg_int(cfg, "TIMEOUT_SECONDS"),
+                "log_retention_days": cfg_int(cfg, "LOG_RETENTION_DAYS"),
+                "jiva_max_iterations": cfg_int(cfg, "JIVA_MAX_ITERATIONS", 30),
+                "jiva_config_file": cfg.get("JIVA_CONFIG_FILE") or DEFAULT_JIVA_CONFIG_FILE,
+                "jiva_directive_file": cfg.get("JIVA_DIRECTIVE_FILE", ""),
+                "jiva_input_price_per_1m": cfg_num(cfg, "JIVA_INPUT_PRICE_PER_1M", None),
+                "jiva_output_price_per_1m": cfg_num(cfg, "JIVA_OUTPUT_PRICE_PER_1M", None),
+                "jiva_bin": cfg.get("JIVA_BIN") or DEFAULT_JIVA_BIN,
+            }
+        else:
+            derived = {
+                "name": self.name,
+                "runner": "claude",
+                "repo_dir": cfg.get("REPO_DIR", ""),
+                "model": cfg.get("MODEL", ""),
+                "permission_mode": cfg.get("PERMISSION_MODE", ""),
+                "max_turns": cfg_int(cfg, "MAX_TURNS"),
+                "max_budget_usd": cfg_num(cfg, "MAX_BUDGET_USD"),
+                "timeout_seconds": cfg_int(cfg, "TIMEOUT_SECONDS"),
+                "log_retention_days": cfg_int(cfg, "LOG_RETENTION_DAYS"),
+                "extra_dirs": cfg.get("EXTRA_DIRS", []),
+                "allowed_tools": cfg.get("ALLOWED_TOOLS", ""),
+                "disallowed_tools": cfg.get("DISALLOWED_TOOLS", ""),
+                "token_file": cfg.get("TOKEN_FILE", DEFAULT_TOKEN_FILE),
+                "claude_bin": cfg.get("CLAUDE_BIN", DEFAULT_CLAUDE_BIN),
+            }
+        # run.sh wins for everything it owns; job.json owns only enabled/schedule.
+        changed = any(meta.get(k) != v for k, v in derived.items())
+        meta.update(derived)
+        meta.setdefault("enabled", False)
+        meta.setdefault("schedule", {})
+        meta.setdefault("created", None)
+        if changed and os.path.isdir(self.dir):
+            self.write_meta(meta)
+        return meta
+
+    def write_meta(self, meta):
+        meta["synced_from_run_sh"] = datetime.datetime.now().isoformat(timespec="seconds")
+        tmp = self.job_json + ".tmp"
+        try:
+            with open(tmp, "w") as fh:
+                json.dump(meta, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            os.replace(tmp, self.job_json)
+        except OSError as exc:
+            err("cannot write %s: %s" % (self.job_json, exc))
+
+    def last_run(self):
+        try:
+            with open(os.path.join(self.state_dir, "last-run.json")) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    def log_dates(self):
+        try:
+            names = os.listdir(self.logs_dir)
+        except OSError:
+            return []
+        dates = [n for n in names
+                 if re.match(r"^\d{4}-\d{2}-\d{2}$", n)
+                 and os.path.isdir(os.path.join(self.logs_dir, n))]
+        return sorted(dates)
+
+    def runs_on(self, date):
+        path = os.path.join(self.logs_dir, date)
+        try:
+            names = sorted(n for n in os.listdir(path) if n.endswith(".log"))
+        except OSError:
+            return []
+        out = []
+        for name in names:
+            out.append(read_run(os.path.join(path, name), date, name[:-4]))
+        return out
+
+    def recent_runs(self, limit=5):
+        out = []
+        for date in reversed(self.log_dates()):
+            out = self.runs_on(date) + out
+            if len(out) >= limit:
+                break
+        return out[-limit:] if limit else out
+
+    def locked_pid(self):
+        try:
+            with open(os.path.join(self.state_dir, "run.lock", "pid")) as fh:
+                pid = int(fh.read().strip())
+        except (OSError, ValueError):
+            return None
+        try:
+            os.kill(pid, 0)
+            return pid
+        except OSError:
+            return None  # stale
+
+
+FOOTER_RE = re.compile(r"^cjob\.([a-z_]+)=(.*)$", re.M)
+
+
+def read_run(log_path, date, hhmmss):
+    """Pull one run's summary from its log footer (+ result.json fallback)."""
+    rec = {
+        "date": date, "time": hhmmss.replace("-", ":"), "log": log_path,
+        "exit_code": None, "duration_seconds": None, "total_cost_usd": None,
+        "num_turns": None, "is_error": None, "killed": False,
+        "session_id": None, "skipped": False, "incomplete": False,
+    }
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, errors="replace") as fh:
+            if size > 16384:
+                fh.seek(size - 16384)
+            tail = fh.read()
+    except OSError:
+        return rec
+
+    found = {}
+    for m in FOOTER_RE.finditer(tail):
+        found[m.group(1)] = m.group(2).strip()
+
+    if found:
+        rec["exit_code"] = _int_or_none(found.get("exit_code"))
+        rec["duration_seconds"] = _int_or_none(found.get("duration_seconds"))
+        rec["num_turns"] = _int_or_none(found.get("num_turns"))
+        rec["total_cost_usd"] = _float_or_none(found.get("total_cost_usd"))
+        rec["is_error"] = found.get("is_error") == "true"
+        rec["killed"] = found.get("killed_by_watchdog") == "yes"
+        rec["session_id"] = found.get("session_id") or None
+    elif "SKIPPED: already running" in tail:
+        rec["skipped"] = True
+        rec["exit_code"] = 0
+    elif "FATAL:" in tail:
+        rec["exit_code"] = 78
+        rec["is_error"] = True
+    else:
+        # Header but no footer: either in flight right now, or the run died
+        # before it could write one. Age tells them apart.
+        try:
+            fresh = (time.time() - os.path.getmtime(log_path)) < 300
+        except OSError:
+            fresh = False
+        if not fresh:
+            rec["incomplete"] = True
+            rec["is_error"] = True
+
+    if rec["total_cost_usd"] is None:
+        data = read_result(log_path[:-4] + ".result.json")
+        if data:
+            rec["total_cost_usd"] = data.get("total_cost_usd")
+            rec["num_turns"] = data.get("num_turns")
+            if rec["is_error"] is None:
+                rec["is_error"] = bool(data.get("is_error"))
+    return rec
+
+
+def read_result(path):
+    try:
+        with open(path, errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    if not text.strip():
+        return None
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except ValueError:
+        for line in reversed(text.strip().splitlines()):
+            try:
+                data = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(data, dict):
+                return data
+    return None
+
+
+def _int_or_none(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_none(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def list_jobs():
+    """A dir under ~/claude-jobs/.agents is a job iff no leading dot and has job.json."""
+    try:
+        names = sorted(os.listdir(AGENTS_DIR))
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        path = os.path.join(AGENTS_DIR, name)
+        if os.path.isdir(path) and os.path.isfile(os.path.join(path, "job.json")):
+            out.append(Job(name))
+    return out
+
+
+def get_job(name):
+    if not name:
+        err("a job name is required")
+        return None
+    job = Job(name)
+    if not os.path.isfile(job.job_json):
+        err("no such job: %s  (try `ls`)" % name)
+        return None
+    return job
+
+
+def cli_state():
+    try:
+        with open(CLI_STATE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cli_state(state):
+    os.makedirs(os.path.dirname(CLI_STATE), exist_ok=True)
+    tmp = CLI_STATE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, CLI_STATE)
+
+
+def open_editor(path):
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        editor = "vi" if sys.stdin.isatty() else ""
+    if not editor:
+        print("  $EDITOR is unset — edit by hand: %s" % path)
+        return 0
+    try:
+        return subprocess.call(shlex.split(editor) + [path])
+    except OSError as exc:
+        err("cannot launch editor %r: %s" % (editor, exc))
+        print("  edit by hand: %s" % path)
+        return 1
+
+
+def fmt_cost(v):
+    return dim("—") if v is None else "$%.4f" % v
+
+
+def fmt_exit(rec):
+    if rec is None:
+        return dim("—")
+    if rec.get("skipped"):
+        return dim("skip")
+    if rec.get("incomplete"):
+        return red("no footer")
+    code = rec.get("exit_code")
+    if code is None:
+        return yellow("running?")
+    if rec.get("killed"):
+        return red("%d kill" % code)
+    if code == 0 and not rec.get("is_error"):
+        return green("0")
+    return red(str(code) if code else "err")
+
+
+def fmt_dur(secs):
+    if secs is None:
+        return dim("—")
+    if secs < 90:
+        return "%ds" % secs
+    return "%dm%02ds" % (secs // 60, secs % 60)
+
+
+def stripped_env(token_file=None):
+    """The environment a scheduled run gets — nothing inherited."""
+    env = {
+        "PATH": "/Users/abi/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": HOME,
+    }
+    if token_file:
+        try:
+            with open(token_file) as fh:
+                # Strip ALL whitespace, not just the ends: a token file written by
+                # a wrapping terminal can carry an internal newline, which the API
+                # rejects as an invalid Authorization header. run.sh does the same
+                # with `tr -d '[:space:]'`.
+                token = re.sub(r"\s+", "", fh.read())
+            if token:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        except OSError:
+            pass
+    return env
+
+
+SECRET_RE = re.compile(r"(sk-ant-[A-Za-z0-9]{4})[A-Za-z0-9_\-]{8,}")
+
+
+def redact(text):
+    """Never echo a credential to the console, even one the API handed back."""
+    return SECRET_RE.sub(r"\1...REDACTED", str(text))
+
+
+# ─────────────────────────── the REPL ─────────────────────────────────
+
+class Cjob(cmd.Cmd):
+    prompt = "%s " % cyan("cjob>") if _TTY else "cjob> "
+    intro = "\n".join([
+        bold("cjob") + " — local scheduled Claude Code jobs",
+        dim("type `help` for commands, `doctor` for a health check, `quit` to exit"),
+    ])
+    doc_header = "commands (type `help <cmd>`)"
+
+    def __init__(self):
+        super().__init__()
+        self.rc = 0
+
+    # ---- plumbing ----
+    def fail(self, msg=None):
+        if msg:
+            err(msg)
+        self.rc = 1
+
+    def emptyline(self):
+        return None
+
+    def default(self, line):
+        self.fail("unknown command: %s  (try `help`)" % line.split()[0])
+
+    def _complete_job(self, text):
+        return [j.name for j in list_jobs() if j.name.startswith(text)]
+
+    # cmd.Cmd falls back to completedefault for any command without its own
+    # complete_<cmd>, so this tab-completes job names everywhere.
+    def completedefault(self, text, line, begidx, endidx):
+        return self._complete_job(text)
+
+    # ---- ls ----
+    def do_ls(self, arg):
+        """ls — list all jobs with schedule, model and last-run status."""
+        jobs = list_jobs()
+        if not jobs:
+            print(dim("no jobs yet — run `new` to create one"))
+            return
+        rows = []
+        for job in jobs:
+            meta = job.meta()
+            last = job.recent_runs(1)
+            rec = last[0] if last else None
+            enabled = meta.get("enabled") and agent_loaded(job.label)
+            if meta.get("enabled") and not agent_loaded(job.label):
+                on = yellow("stale")
+            else:
+                on = green("yes") if enabled else dim("no")
+            when = dim("never")
+            if rec:
+                when = "%s %s" % (rec["date"][5:], rec["time"])
+            running = job.locked_pid()
+            name = job.name + (" " + yellow("*running*") if running else "")
+            if meta.get("runner") == "jiva":
+                engine = "jiva"
+            else:
+                engine = meta.get("model") or dim("?")
+            rows.append([
+                name, on, describe_schedule(meta), engine,
+                when, fmt_exit(rec), fmt_cost(rec["total_cost_usd"] if rec else None),
+            ])
+        table(rows, ["JOB", "ON", "SCHEDULE", "RUNNER/MODEL", "LAST RUN", "EXIT", "LAST COST"])
+        print(dim("\ncost is est. API-equivalent (Claude: Max plan quota; Jiva: only shown if you set a $/1M-token price)"))
+
+    # ---- show ----
+    def do_show(self, arg):
+        """show <job> — full detail: config, repo, prompt, plist status, last runs."""
+        job = get_job(shlex.split(arg)[0] if arg.strip() else "")
+        if not job:
+            return self.fail()
+        cfg, meta = job.config(), job.meta()
+
+        print(bold("\n%s" % job.name))
+        print(dim("  " + job.dir))
+
+        runner = cfg.get("RUNNER") or "claude"
+        print(bold("\n  config (from run.sh)") + dim("  [runner: %s]" % runner))
+        rows = []
+        for key in config_keys_for(cfg):
+            val = cfg.get(key, "")
+            if isinstance(val, list):
+                val = " ".join(val) if val else dim("<none>")
+            elif val == "":
+                val = dim("<empty>")
+            chunks = _wrap_value(val)
+            rows.append(["    " + key, chunks[0]])
+            for extra in chunks[1:]:
+                rows.append(["", extra])
+        table(rows, ["    KEY", "VALUE"])
+
+        if runner == "jiva":
+            warn("  Jiva's --code mode has no workspace-boundary enforcement — its "
+                 "file-write and shell tools can reach anywhere this user can, not "
+                 "just REPO_DIR. Only use this runner where that's an acceptable risk.")
+        else:
+            auto = auto_mode_supported(cfg.get("MODEL", ""))
+            if cfg.get("MODEL", "") in MODEL_ALIASES:
+                warn("  MODEL is the alias %r — pin a full ID so behaviour and cost "
+                     "don't drift on the next release" % cfg.get("MODEL"))
+            if cfg.get("PERMISSION_MODE") == "auto":
+                if auto is False:
+                    warn("  permission mode `auto` with %s: unsupported — the job fails "
+                         "at startup, not gracefully at runtime" % cfg.get("MODEL"))
+                elif auto is None:
+                    warn("  permission mode `auto` with an unrecognised model %r — "
+                         "verify it supports auto mode" % cfg.get("MODEL"))
+            if cfg.get("PERMISSION_MODE") == "bypassPermissions":
+                warn("  permission mode `bypassPermissions` disables safety checks "
+                     "entirely — only appropriate for a genuinely isolated repo")
+
+        print(bold("\n  repo"))
+        repo = cfg.get("REPO_DIR", "")
+        info = git_info(repo)
+        if not os.path.isdir(repo):
+            print("    %s %s" % (red("MISSING"), repo))
+        elif info:
+            print("    %s  %s @ %s%s" % (repo, info["branch"], info["sha"],
+                                         yellow(" (dirty)") if info["dirty"] else ""))
+        else:
+            print("    %s  %s" % (repo, yellow("not a git repo")))
+
+        print(bold("\n  prompt") + dim("  (%s)" % job.prompt))
+        try:
+            with open(job.prompt) as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            lines = []
+        if not lines:
+            print("    %s" % red("empty or missing"))
+        for line in lines[:24]:
+            print("    " + dim(line) if line.startswith("<!--") else "    " + line)
+        if len(lines) > 24:
+            print(dim("    ... %d more lines" % (len(lines) - 24)))
+
+        print(bold("\n  schedule"))
+        print("    spec     : %s" % describe_schedule(meta))
+        print("    label    : %s" % job.label)
+        print("    plist    : %s" % (job.plist if os.path.exists(job.plist)
+                                     else dim("not written")))
+        loaded = agent_loaded(job.label)
+        state = green("loaded") if loaded else dim("not loaded")
+        if meta.get("enabled") and not loaded:
+            state = yellow("marked enabled in job.json but NOT loaded in launchd")
+        elif loaded and not meta.get("enabled"):
+            state = yellow("loaded in launchd but marked disabled in job.json")
+        print("    launchd  : %s" % state)
+        if loaded:
+            rc, out, _ = launchctl("print", "%s/%s" % (DOMAIN, job.label))
+            if rc == 0:
+                for key in ("state =", "last exit code =", "runs =", "pid ="):
+                    for line in out.splitlines():
+                        if key in line:
+                            print("    %s" % dim(line.strip()))
+                            break
+
+        pid = job.locked_pid()
+        if pid:
+            print("\n  %s currently running (pid %d)" % (yellow("●"), pid))
+
+        print(bold("\n  last 5 runs"))
+        runs = list(reversed(job.recent_runs(5)))
+        if not runs:
+            print(dim("    no runs yet"))
+        else:
+            table([["    %s %s" % (r["date"], r["time"]), fmt_exit(r),
+                    fmt_dur(r["duration_seconds"]),
+                    dim("—") if r["num_turns"] is None else str(r["num_turns"]),
+                    fmt_cost(r["total_cost_usd"])] for r in runs],
+                  ["    WHEN", "EXIT", "DURATION", "TURNS", "COST"])
+        print()
+
+    # ---- new ----
+    def do_new(self, arg):
+        """new — interactive wizard that scaffolds a job (does NOT enable it)."""
+        if not sys.stdin.isatty():
+            return self.fail("`new` is interactive; run it from a terminal")
+        st = cli_state()
+
+        def ask(label, default="", validate=None):
+            while True:
+                suffix = dim(" [%s]" % default) if default else ""
+                try:
+                    raw = input("  %s%s: " % (label, suffix)).strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    raise
+                val = raw or default
+                if not val:
+                    err("required")
+                    continue
+                if validate:
+                    problem = validate(val)
+                    if problem:
+                        err(problem)
+                        continue
+                return val
+
+        def ask_optional(label, default=""):
+            """Like ask(), but blank is a valid answer (returns "")."""
+            suffix = dim(" [%s]" % default) if default else dim(" [blank]")
+            try:
+                raw = input("  %s%s: " % (label, suffix)).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                raise
+            return raw or default
+
+        print(bold("\nnew job\n"))
+        try:
+            def check_name(v):
+                if not NAME_RE.match(v):
+                    return ("job names must match ^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$ "
+                            "— the name becomes a launchd label and a path")
+                if os.path.exists(os.path.join(AGENTS_DIR, v)):
+                    return "%s already exists" % v
+                return None
+
+            name = ask("job name", validate=check_name)
+
+            print(dim("    runners: claude (thinking/strategy) | jiva (low-level action execution)"))
+            runner = ask("runner", st.get("last_runner", "claude"),
+                        lambda v: None if v in RUNNERS
+                        else "pick one of: " + ", ".join(RUNNERS))
+
+            if runner == "jiva":
+                self._new_jiva_job(name, st, ask, ask_optional)
+            else:
+                self._new_claude_job(name, st, ask)
+        except (EOFError, KeyboardInterrupt):
+            return self.fail("cancelled")
+
+    def _new_claude_job(self, name, st, ask):
+        repo = ask("repo dir (the brain repo Claude runs inside)",
+                   st.get("repo_dir", ""),
+                   lambda v: None if os.path.isdir(os.path.expanduser(v))
+                   else "not a directory: %s" % v)
+        repo = os.path.abspath(os.path.expanduser(repo))
+        if not git_info(repo):
+            warn("%s is not a git repo — the run header won't have a commit" % repo)
+
+        def check_model(v):
+            if v in MODEL_ALIASES:
+                return ("%r is an alias; it moves when Anthropic ships a release. "
+                        "Pin a full ID, e.g. claude-sonnet-5" % v)
+            return None
+
+        model = ask("model (pinned full ID)", st.get("model", DEFAULT_MODEL),
+                    check_model)
+
+        print(dim("    modes: " + " | ".join(PERMISSION_MODES)))
+        supported = auto_mode_supported(model)
+
+        def check_mode(v):
+            if v not in PERMISSION_MODES:
+                return "pick one of: " + ", ".join(PERMISSION_MODES)
+            # §9.4: an unsupported model + auto fails at startup, not
+            # gracefully at runtime. Refuse to scaffold a broken job.
+            if v == "auto" and supported is False:
+                return ("auto mode needs Opus 4.6+, Sonnet 4.6+ or Fable 5; "
+                        "%s does not support it and the job would fail at "
+                        "startup. Use dontAsk, or restart with a newer model."
+                        % model)
+            return None
+
+        mode = ask("permission mode", st.get("permission_mode", "dontAsk"),
+                   check_mode)
+        if mode == "auto" and supported is None:
+            warn("cannot verify that %s supports auto mode — if it does not, "
+                 "the job fails at startup" % model)
+        if mode == "auto":
+            print(dim("    note: under -p, repeated classifier blocks abort the "
+                      "session, and each check costs tokens."))
+        if mode == "bypassPermissions":
+            warn("bypassPermissions disables all safety checks and refuses to "
+                 "start under root/sudo. No acceptance dialog is shown under -p.\n"
+                 "      Only use this for a genuinely isolated repo.")
+
+        print(dim("    " + SCHEDULE_HELP))
+        spec_holder = {}
+
+        def check_spec(v):
+            try:
+                spec_holder["parsed"] = parse_schedule(v)
+            except ValueError as exc:
+                return str(exc)
+            return None
+
+        spec = ask("schedule", st.get("schedule", "daily 03:00"), check_spec)
+        canon, entries = spec_holder["parsed"]
+
+        max_turns = ask("max turns", str(st.get("max_turns", 25)),
+                        lambda v: None if v.isdigit() and int(v) > 0
+                        else "a positive integer")
+        budget = ask("max budget USD", str(st.get("max_budget_usd", 3)),
+                     lambda v: None if re.match(r"^\d+(\.\d+)?$", v)
+                     else "a number")
+        timeout = ask("timeout seconds (0 disables)",
+                      str(st.get("timeout_seconds", 1800)),
+                      lambda v: None if v.isdigit() else "an integer")
+        retention = ask("log retention days (0 disables)",
+                        str(st.get("log_retention_days", 30)),
+                        lambda v: None if v.isdigit() else "an integer")
+        path_extra = input("  %s%s: " % (
+            "extra PATH entries (colon-separated, blank for none)",
+            dim(" [%s]" % st.get("path_extra", "")))).strip() \
+            or st.get("path_extra", "")
+
+        job = Job(name)
+        try:
+            os.makedirs(job.state_dir, exist_ok=True)
+            os.makedirs(job.logs_dir, exist_ok=True)
+            write_run_sh(job, {
+                "JOB_NAME": name, "REPO_DIR": repo, "EXTRA_DIRS": [],
+                "MODEL": model, "PERMISSION_MODE": mode, "MAX_TURNS": max_turns,
+                "MAX_BUDGET_USD": budget, "ALLOWED_TOOLS": "",
+                "DISALLOWED_TOOLS": "", "TIMEOUT_SECONDS": timeout,
+                "LOG_RETENTION_DAYS": retention, "PATH_EXTRA": path_extra,
+                "TOKEN_FILE": DEFAULT_TOKEN_FILE, "CLAUDE_BIN": DEFAULT_CLAUDE_BIN,
+            }, template_name="run.sh.tmpl")
+            shutil.copyfile(os.path.join(TEMPLATES, "prompt.md.tmpl"), job.prompt)
+        except OSError as exc:
+            return self.fail("scaffolding failed: %s" % exc)
+
+        meta = job.meta()
+        meta["created"] = datetime.datetime.now().isoformat(timespec="seconds")
+        meta["enabled"] = False
+        meta["schedule"] = {"spec": canon, "entries": entries}
+        job.write_meta(meta)
+        write_plist(job, entries)
+
+        save_cli_state(dict(st, **{
+            "last_runner": "claude",
+            "repo_dir": repo, "model": model, "permission_mode": mode,
+            "schedule": canon, "max_turns": int(max_turns),
+            "max_budget_usd": float(budget), "timeout_seconds": int(timeout),
+            "log_retention_days": int(retention), "path_extra": path_extra,
+        }))
+
+        print(green("\ncreated %s" % job.dir))
+        print("  run.sh     %s" % job.run_sh)
+        print("  prompt.md  %s" % job.prompt)
+        print("  plist      %s %s" % (job.plist, dim("(written, not loaded)")))
+        print(bold("\nbefore this job can work unattended:"))
+        print("  1. Grant Full Disk Access to /bin/bash, or TCC will block reads of")
+        print("     ~/Documents, ~/Desktop, ~/Downloads and iCloud Drive:")
+        print("     " + FDA_HELP.replace("\n", "\n     "))
+        print("  2. Write the task into prompt.md (opening it now).")
+        print("  3. Test it: %s" % bold("cjob run %s" % name))
+        print("  4. Activate it: %s" % bold("cjob enable %s" % name))
+        print(dim("     (creation and activation are separate on purpose)"))
+        print()
+        open_editor(job.prompt)
+
+    def _new_jiva_job(self, name, st, ask, ask_optional):
+        workspace = ask("workspace dir (Jiva runs --code mode here)",
+                        st.get("jiva_repo_dir", st.get("repo_dir", "")),
+                        lambda v: None if os.path.isdir(os.path.expanduser(v))
+                        else "not a directory: %s" % v)
+        workspace = os.path.abspath(os.path.expanduser(workspace))
+        if not git_info(workspace):
+            warn("%s is not a git repo — the run header won't have a commit" % workspace)
+        warn("Jiva's --code mode has no workspace-boundary enforcement — its "
+             "file-write and shell tools can reach anywhere this user can, not "
+             "just this directory. Only proceed if that's an acceptable risk here.")
+
+        max_iters = ask("max iterations", str(st.get("jiva_max_iterations", 30)),
+                        lambda v: None if v.isdigit() and int(v) > 0
+                        else "a positive integer")
+
+        config_file = ask("jiva config file (model + apiKey)",
+                          st.get("jiva_config_file", DEFAULT_JIVA_CONFIG_FILE),
+                          lambda v: None if os.path.isfile(os.path.expanduser(v))
+                          else "not a file: %s" % v)
+        config_file = os.path.abspath(os.path.expanduser(config_file))
+
+        directive_file = ask_optional(
+            "directive file (blank = auto-discover jiva-directive.md/CLAUDE.md/AGENTS.md)",
+            st.get("jiva_directive_file", ""))
+
+        print(dim("    Jiva has no cost API (provider-agnostic) — leave blank to skip cost"))
+        input_price = ask_optional("input price per 1M tokens, USD (blank = no cost tracked)",
+                                   st.get("jiva_input_price_per_1m", ""))
+        output_price = ask_optional("output price per 1M tokens, USD (blank = no cost tracked)",
+                                    st.get("jiva_output_price_per_1m", ""))
+
+        print(dim("    " + SCHEDULE_HELP))
+        spec_holder = {}
+
+        def check_spec(v):
+            try:
+                spec_holder["parsed"] = parse_schedule(v)
+            except ValueError as exc:
+                return str(exc)
+            return None
+
+        spec = ask("schedule", st.get("schedule", "daily 03:00"), check_spec)
+        canon, entries = spec_holder["parsed"]
+
+        timeout = ask("timeout seconds (0 disables)",
+                      str(st.get("timeout_seconds", 1800)),
+                      lambda v: None if v.isdigit() else "an integer")
+        retention = ask("log retention days (0 disables)",
+                        str(st.get("log_retention_days", 30)),
+                        lambda v: None if v.isdigit() else "an integer")
+        path_extra = input("  %s%s: " % (
+            "extra PATH entries (colon-separated — must include jiva's node/bin dir)",
+            dim(" [%s]" % st.get("jiva_path_extra", DEFAULT_JIVA_PATH_EXTRA)))).strip() \
+            or st.get("jiva_path_extra", DEFAULT_JIVA_PATH_EXTRA)
+
+        job = Job(name)
+        try:
+            os.makedirs(job.state_dir, exist_ok=True)
+            os.makedirs(job.logs_dir, exist_ok=True)
+            write_run_sh(job, {
+                "JOB_NAME": name, "REPO_DIR": workspace,
+                "JIVA_MAX_ITERATIONS": max_iters, "JIVA_CONFIG_FILE": config_file,
+                "JIVA_DIRECTIVE_FILE": directive_file,
+                "JIVA_INPUT_PRICE_PER_1M": input_price,
+                "JIVA_OUTPUT_PRICE_PER_1M": output_price,
+                "TIMEOUT_SECONDS": timeout, "LOG_RETENTION_DAYS": retention,
+                "PATH_EXTRA": path_extra, "JIVA_BIN": DEFAULT_JIVA_BIN,
+            }, template_name="run-jiva.sh.tmpl")
+            shutil.copyfile(os.path.join(TEMPLATES, "prompt.md.tmpl"), job.prompt)
+        except OSError as exc:
+            return self.fail("scaffolding failed: %s" % exc)
+
+        meta = job.meta()
+        meta["created"] = datetime.datetime.now().isoformat(timespec="seconds")
+        meta["enabled"] = False
+        meta["schedule"] = {"spec": canon, "entries": entries}
+        job.write_meta(meta)
+        write_plist(job, entries)
+
+        save_cli_state(dict(st, **{
+            "last_runner": "jiva",
+            "jiva_repo_dir": workspace, "jiva_max_iterations": int(max_iters),
+            "jiva_config_file": config_file, "jiva_directive_file": directive_file,
+            "jiva_input_price_per_1m": input_price, "jiva_output_price_per_1m": output_price,
+            "jiva_path_extra": path_extra,
+            "schedule": canon, "timeout_seconds": int(timeout),
+            "log_retention_days": int(retention),
+        }))
+
+        print(green("\ncreated %s" % job.dir))
+        print("  run.sh     %s" % job.run_sh)
+        print("  prompt.md  %s" % job.prompt)
+        print("  plist      %s %s" % (job.plist, dim("(written, not loaded)")))
+        print(bold("\nbefore this job can work unattended:"))
+        print("  1. Grant Full Disk Access to /bin/bash, or TCC will block reads of")
+        print("     ~/Documents, ~/Desktop, ~/Downloads and iCloud Drive:")
+        print("     " + FDA_HELP.replace("\n", "\n     "))
+        print("  2. Write the task into prompt.md (opening it now).")
+        print("  3. Test it: %s" % bold("cjob run %s" % name))
+        print("  4. Activate it: %s" % bold("cjob enable %s" % name))
+        print(dim("     (creation and activation are separate on purpose)"))
+        print()
+        open_editor(job.prompt)
+
+    # ---- edit ----
+    def do_edit(self, arg):
+        """edit <job> [prompt|script|config] — open a job file in $EDITOR."""
+        parts = shlex.split(arg)
+        job = get_job(parts[0] if parts else "")
+        if not job:
+            return self.fail()
+        what = (parts[1] if len(parts) > 1 else "prompt").lower()
+        target = {"prompt": job.prompt, "script": job.run_sh, "run": job.run_sh,
+                  "config": job.job_json, "job": job.job_json}.get(what)
+        if not target:
+            return self.fail("edit what? prompt | script | config")
+        if what in ("config", "job"):
+            warn("job.json is metadata; run.sh is the source of truth for how the "
+                 "job runs. Editing config here will be overwritten on next sync "
+                 "for any key run.sh owns.")
+        rc = open_editor(target)
+        if what in ("script", "run"):
+            job.meta()  # resync job.json from the edited variable block
+            print(dim("job.json resynced from run.sh"))
+        if what in ("config", "job"):
+            # `enabled` in job.json is metadata. launchd is the only authority on
+            # whether the job actually fires, and an editor cannot talk to it.
+            meta = job.meta()
+            loaded = agent_loaded(job.label)
+            if meta.get("enabled") and not loaded:
+                warn("job.json now says enabled, but launchd has no agent for %s "
+                     "— it will NOT fire.\n      Editing job.json cannot schedule "
+                     "anything. Run: %s" % (job.name, bold("cjob enable " + job.name)))
+                self.rc = 1
+            elif loaded and not meta.get("enabled"):
+                warn("job.json now says disabled, but the launchd agent is still "
+                     "loaded and WILL fire.\n      Run: %s"
+                     % bold("cjob disable " + job.name))
+                self.rc = 1
+        if rc:
+            self.rc = rc
+
+    # ---- run ----
+    def do_run(self, arg):
+        """run <job> — run run.sh now in the foreground, with a stripped env."""
+        job = get_job(shlex.split(arg)[0] if arg.strip() else "")
+        if not job:
+            return self.fail()
+        if not os.access(job.run_sh, os.X_OK):
+            warn("%s is not executable — fixing" % job.run_sh)
+            try:
+                os.chmod(job.run_sh, 0o755)
+            except OSError as exc:
+                return self.fail("chmod failed: %s" % exc)
+        # §9.7: `env -i` so a passing run actually proves something.
+        argv = ["/usr/bin/env", "-i", "/bin/bash", job.run_sh]
+        print(dim("$ " + " ".join(shlex.quote(a) for a in argv)))
+        try:
+            rc = subprocess.call(argv)
+        except KeyboardInterrupt:
+            print()
+            warn("interrupted — run.sh's EXIT trap releases the lock")
+            self.rc = 130
+            return
+        except OSError as exc:
+            return self.fail("cannot run: %s" % exc)
+        print((green("exit 0") if rc == 0 else red("exit %d" % rc)))
+        if rc:
+            self.rc = rc
+
+    # ---- logs ----
+    def do_logs(self, arg):
+        """logs <job> [--date YYYY-MM-DD] — list runs for a date."""
+        parts = shlex.split(arg)
+        date = None
+        if "--date" in parts:
+            i = parts.index("--date")
+            if i + 1 >= len(parts):
+                return self.fail("--date needs YYYY-MM-DD")
+            date = parts[i + 1]
+            parts = parts[:i] + parts[i + 2:]
+        job = get_job(parts[0] if parts else "")
+        if not job:
+            return self.fail()
+        dates = job.log_dates()
+        if not dates:
+            print(dim("no logs yet for %s" % job.name))
+            return
+        if date is None:
+            today = datetime.date.today().isoformat()
+            date = today if today in dates else dates[-1]
+            if date != today:
+                print(dim("no runs today; showing most recent date with runs"))
+        elif date not in dates:
+            return self.fail("no logs for %s on %s (have: %s)"
+                             % (job.name, date, ", ".join(dates[-8:])))
+        runs = job.runs_on(date)
+        print(bold("%s — %s  (%d run%s)"
+                   % (job.name, date, len(runs), "" if len(runs) == 1 else "s")))
+        table([[r["time"], fmt_exit(r), fmt_dur(r["duration_seconds"]),
+                dim("—") if r["num_turns"] is None else str(r["num_turns"]),
+                fmt_cost(r["total_cost_usd"]),
+                dim(os.path.basename(r["log"]))] for r in runs],
+              ["TIME", "EXIT", "DURATION", "TURNS", "COST", "FILE"])
+        print(dim("\n`log %s %s <time>` to print one" % (job.name, date)))
+
+    # ---- log ----
+    def do_log(self, arg):
+        """log <job> [<date> <time>] — print one log; bare form = latest run."""
+        parts = shlex.split(arg)
+        job = get_job(parts[0] if parts else "")
+        if not job:
+            return self.fail()
+        if len(parts) >= 3:
+            path = os.path.join(job.logs_dir, parts[1],
+                                parts[2].replace(":", "-") + ".log")
+        else:
+            runs = job.recent_runs(1)
+            if not runs:
+                return self.fail("no runs yet for %s" % job.name)
+            path = runs[0]["log"]
+        if not os.path.isfile(path):
+            return self.fail("no such log: %s" % path)
+        print(dim("── %s ──" % path))
+        try:
+            with open(path, errors="replace") as fh:
+                sys.stdout.write(fh.read())
+        except OSError as exc:
+            return self.fail("cannot read %s: %s" % (path, exc))
+
+    # ---- tail ----
+    def do_tail(self, arg):
+        """tail <job> — follow the newest log file live (Ctrl-C to stop)."""
+        job = get_job(shlex.split(arg)[0] if arg.strip() else "")
+        if not job:
+            return self.fail()
+        deadline = time.time() + 20
+        path = None
+        while True:
+            runs = job.recent_runs(1)
+            if runs:
+                path = runs[0]["log"]
+                break
+            if time.time() > deadline:
+                return self.fail("no logs yet for %s" % job.name)
+            if _TTY:
+                print(dim("waiting for a log to appear..."), end="\r", flush=True)
+            time.sleep(1)
+        print(dim("── tail -f %s ──  (Ctrl-C to stop)" % path))
+        try:
+            subprocess.call(["tail", "-n", "200", "-f", path])
+        except KeyboardInterrupt:
+            print()
+        except OSError as exc:
+            return self.fail("tail failed: %s" % exc)
+
+    # ---- enable / disable ----
+    def do_enable(self, arg):
+        """enable <job> — bootstrap the launchd agent."""
+        job = get_job(shlex.split(arg)[0] if arg.strip() else "")
+        if not job:
+            return self.fail()
+        meta = job.meta()
+        entries = (meta.get("schedule") or {}).get("entries")
+        if not entries:
+            return self.fail("%s has no schedule — `schedule %s <spec>` first.\n  %s"
+                             % (job.name, job.name, SCHEDULE_HELP))
+        if not os.access(job.run_sh, os.X_OK):
+            try:
+                os.chmod(job.run_sh, 0o755)
+                print(dim("chmod +x %s" % job.run_sh))
+            except OSError as exc:
+                return self.fail("run.sh is not executable and chmod failed: %s" % exc)
+        write_plist(job, entries)
+        if agent_loaded(job.label):
+            print(dim("already loaded; reloading to pick up the current plist"))
+            launchctl("bootout", "%s/%s" % (DOMAIN, job.label))
+        rc, out, error = launchctl("bootstrap", DOMAIN, job.plist)
+        if rc != 0:
+            warn("launchctl bootstrap failed (rc=%d): %s"
+                 % (rc, (error or out).strip() or "no output"))
+            print(dim("falling back to `launchctl load -w`"))
+            rc, out, error = launchctl("load", "-w", job.plist)
+            if rc != 0:
+                return self.fail("launchctl load -w also failed (rc=%d): %s"
+                                 % (rc, (error or out).strip() or "no output"))
+        if not agent_loaded(job.label):
+            return self.fail("launchctl reported success but %s is not loaded"
+                             % job.label)
+        meta["enabled"] = True
+        job.write_meta(meta)
+        print(green("enabled %s" % job.name) + " — %s" % describe_schedule(meta))
+        print(dim("  launchd runs a missed StartCalendarInterval on wake, so a "
+                  "closed lid delays the run rather than skipping it"))
+
+    def do_disable(self, arg):
+        """disable <job> — bootout the launchd agent."""
+        job = get_job(shlex.split(arg)[0] if arg.strip() else "")
+        if not job:
+            return self.fail()
+        meta = job.meta()
+        if not agent_loaded(job.label):
+            meta["enabled"] = False
+            job.write_meta(meta)
+            print(dim("%s was not loaded; marked disabled" % job.name))
+            return
+        rc, out, error = launchctl("bootout", "%s/%s" % (DOMAIN, job.label))
+        if rc != 0:
+            warn("launchctl bootout failed (rc=%d): %s"
+                 % (rc, (error or out).strip() or "no output"))
+            print(dim("falling back to `launchctl unload -w`"))
+            rc, out, error = launchctl("unload", "-w", job.plist)
+            if rc != 0:
+                return self.fail("launchctl unload -w also failed (rc=%d): %s"
+                                 % (rc, (error or out).strip() or "no output"))
+        meta["enabled"] = False
+        job.write_meta(meta)
+        print(green("disabled %s" % job.name))
+
+    # ---- schedule ----
+    def do_schedule(self, arg):
+        """schedule <job> <spec> — set fire times. hourly | daily 03:00 | mon,thu 07:00"""
+        parts = shlex.split(arg)
+        job = get_job(parts[0] if parts else "")
+        if not job:
+            return self.fail()
+        if len(parts) < 2:
+            meta = job.meta()
+            print("%s: %s" % (job.name, describe_schedule(meta)))
+            print(dim(SCHEDULE_HELP))
+            return
+        try:
+            canon, entries = parse_schedule(" ".join(parts[1:]))
+        except ValueError as exc:
+            return self.fail(str(exc))
+        meta = job.meta()
+        meta["schedule"] = {"spec": canon, "entries": entries}
+        job.write_meta(meta)
+        write_plist(job, entries)
+        print(green("schedule set") + ": %s -> %s" % (job.name, canon))
+        for entry in entries:
+            bits = []
+            if "Weekday" in entry:
+                bits.append(DAY_NAMES[entry["Weekday"]])
+            if "Hour" in entry:
+                bits.append("%02d:%02d" % (entry["Hour"], entry["Minute"]))
+            else:
+                bits.append("every hour at :%02d" % entry["Minute"])
+            print(dim("  " + " ".join(bits)))
+        if meta.get("enabled") or agent_loaded(job.label):
+            print(dim("reloading the agent to apply..."))
+            launchctl("bootout", "%s/%s" % (DOMAIN, job.label))
+            rc, out, error = launchctl("bootstrap", DOMAIN, job.plist)
+            if rc != 0:
+                rc, out, error = launchctl("load", "-w", job.plist)
+            if rc != 0 or not agent_loaded(job.label):
+                meta["enabled"] = False
+                job.write_meta(meta)
+                return self.fail("reload failed (rc=%d): %s — job is now DISABLED"
+                                 % (rc, (error or out).strip() or "no output"))
+            print(green("reloaded"))
+
+    # ---- usage ----
+    def do_usage(self, arg):
+        """usage [<job>] [--days N] — aggregate cost and turns across runs."""
+        parts = shlex.split(arg)
+        days = 7
+        if "--days" in parts:
+            i = parts.index("--days")
+            if i + 1 >= len(parts) or not parts[i + 1].isdigit():
+                return self.fail("--days needs a positive integer")
+            days = int(parts[i + 1])
+            parts = parts[:i] + parts[i + 2:]
+        jobs = list_jobs()
+        if parts:
+            job = get_job(parts[0])
+            if not job:
+                return self.fail()
+            jobs = [job]
+        if not jobs:
+            print(dim("no jobs"))
+            return
+
+        cutoff = datetime.date.today() - datetime.timedelta(days=days - 1)
+        rows, tot_cost, tot_turns, tot_runs, tot_err, tot_secs = [], 0.0, 0, 0, 0, 0
+        auto_jobs = []
+        for job in jobs:
+            cost = turns = runs = errs = secs = 0
+            cost = 0.0
+            for date in job.log_dates():
+                try:
+                    day = datetime.date.fromisoformat(date)
+                except ValueError:
+                    continue
+                if day < cutoff:
+                    continue
+                for rec in job.runs_on(date):
+                    if rec.get("skipped"):
+                        continue
+                    runs += 1
+                    if rec.get("is_error"):
+                        errs += 1
+                    if rec.get("total_cost_usd"):
+                        cost += rec["total_cost_usd"]
+                    if rec.get("num_turns"):
+                        turns += rec["num_turns"]
+                    if rec.get("duration_seconds"):
+                        secs += rec["duration_seconds"]
+            meta = job.meta()
+            if meta.get("permission_mode") == "auto":
+                auto_jobs.append(job.name)
+            rows.append([job.name, str(runs),
+                         red(str(errs)) if errs else green("0"),
+                         str(turns), fmt_dur(secs) if secs else dim("—"),
+                         "$%.4f" % cost,
+                         "$%.4f" % (cost / runs) if runs else dim("—")])
+            tot_cost += cost
+            tot_turns += turns
+            tot_runs += runs
+            tot_err += errs
+            tot_secs += secs
+
+        print(bold("usage — last %d day%s (since %s)"
+                   % (days, "" if days == 1 else "s", cutoff.isoformat())))
+        table(rows, ["JOB", "RUNS", "ERRORS", "TURNS", "WALL", "COST", "COST/RUN"])
+        print(bold("\n  total: %d runs, %d errors, %d turns, %s wall, $%.4f"
+                   % (tot_runs, tot_err, tot_turns, fmt_dur(tot_secs), tot_cost)))
+        print(dim("\n  Cost is an est. API-equivalent figure (Claude jobs: Max plan quota,"))
+        print(dim("  NOT a bill; Jiva jobs: only computed if you set a $/1M-token price)."))
+        print(dim("  On a Max subscription Claude runs consume plan quota (a rolling 5-hour window"))
+        print(dim("  plus a weekly cap), and they compete with your interactive usage for"))
+        print(dim("  the same quota — one reason to schedule for 3am."))
+        if auto_jobs:
+            print(yellow("\n  auto-mode jobs: %s" % ", ".join(auto_jobs)))
+            print(dim("  Auto mode routes shell commands and network calls through a"))
+            print(dim("  classifier; each check sends transcript context, so cost per turn"))
+            print(dim("  is meaningfully higher than dontAsk. Reads and working-directory"))
+            print(dim("  edits skip it. If runs die early, narrow the prompt or add explicit"))
+            print(dim("  allow rules — do not just raise --max-turns."))
+        if tot_err:
+            print(yellow("\n  %d run%s errored — `logs <job>` then `log <job> <date> <time>`"
+                         % (tot_err, "" if tot_err == 1 else "s")))
+
+    # ---- rm ----
+    def do_rm(self, arg):
+        """rm <job> — disable and delete a job after typed confirmation."""
+        job = get_job(shlex.split(arg)[0] if arg.strip() else "")
+        if not job:
+            return self.fail()
+        if not sys.stdin.isatty():
+            return self.fail("`rm` requires an interactive confirmation")
+        print("about to delete %s" % bold(job.dir))
+        runs = len([r for d in job.log_dates() for r in job.runs_on(d)])
+        print(dim("  %d logged run(s), plist %s"
+                  % (runs, "present" if os.path.exists(job.plist) else "absent")))
+        try:
+            typed = input("type the job name to confirm: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return self.fail("cancelled")
+        if typed != job.name:
+            return self.fail("name did not match — nothing deleted")
+        keep_logs = False
+        if runs:
+            try:
+                keep_logs = input("keep logs? [y/N]: ").strip().lower().startswith("y")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return self.fail("cancelled")
+
+        if agent_loaded(job.label):
+            rc, out, error = launchctl("bootout", "%s/%s" % (DOMAIN, job.label))
+            if rc != 0:
+                launchctl("unload", "-w", job.plist)
+            if agent_loaded(job.label):
+                return self.fail("could not unload %s — refusing to delete a job "
+                                 "launchd still knows about: %s"
+                                 % (job.label, (error or out).strip()))
+            print(dim("unloaded %s" % job.label))
+        if os.path.exists(job.plist):
+            try:
+                os.remove(job.plist)
+                print(dim("removed %s" % job.plist))
+            except OSError as exc:
+                warn("could not remove plist: %s" % exc)
+
+        kept = None
+        if keep_logs:
+            kept = os.path.join(AGENTS_DIR, ".archived-logs", job.name)
+            os.makedirs(os.path.dirname(kept), exist_ok=True)
+            if os.path.exists(kept):
+                kept += "-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            try:
+                shutil.move(job.logs_dir, kept)
+            except (OSError, shutil.Error) as exc:
+                warn("could not preserve logs: %s" % exc)
+                kept = None
+        try:
+            shutil.rmtree(job.dir)
+        except OSError as exc:
+            return self.fail("could not delete %s: %s" % (job.dir, exc))
+        print(green("deleted %s" % job.name))
+        if kept:
+            print("  logs kept at %s" % kept)
+
+    # ---- doctor ----
+    def do_doctor(self, arg):
+        """doctor [--quick] — run every health check. --quick skips the live token test."""
+        parts = shlex.split(arg)
+        quick = "--quick" in parts or "--no-token-test" in parts
+        d = Doctor()
+        jobs = list_jobs()
+        cfgs = [(j, j.config()) for j in jobs]
+
+        # Every distinct binary/token across all jobs, not just the first one's.
+        def distinct(key, fallback):
+            vals = sorted({(cfg.get(key) or fallback) for _, cfg in cfgs})
+            return vals or [fallback]
+
+        bins = distinct("CLAUDE_BIN", DEFAULT_CLAUDE_BIN)
+        tokens = distinct("TOKEN_FILE", DEFAULT_TOKEN_FILE)
+
+        def users_of(key, value, fallback):
+            return [j.name for j, cfg in cfgs if (cfg.get(key) or fallback) == value]
+
+        # 1 — claude binary
+        good_bins, notes, problems = [], [], []
+        for path in bins:
+            who = ", ".join(users_of("CLAUDE_BIN", path, DEFAULT_CLAUDE_BIN)) or "default"
+            if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+                problems.append("%s: not executable (used by %s)" % (path, who))
+                continue
+            rc, out, _ = run([path, "--version"], timeout=30)
+            if rc != 0:
+                problems.append("%s: `--version` failed rc=%d (used by %s)"
+                                % (path, rc, who))
+                continue
+            good_bins.append(path)
+            notes.append("%s — %s" % (path, out.strip()))
+        if problems:
+            d.bad("claude binary", "; ".join(problems),
+                  "install Claude Code (claude install stable), or fix CLAUDE_BIN in\n"
+                  "    the job's run.sh — run.sh is the source of truth")
+        else:
+            d.ok("claude binary", "; ".join(notes))
+        claude_bin = good_bins[0] if good_bins else bins[0]
+
+        # 2 — token files
+        good_tokens, notes, problems = [], [], []
+        for path in tokens:
+            who = ", ".join(users_of("TOKEN_FILE", path, DEFAULT_TOKEN_FILE)) or "default"
+            if not os.path.isfile(path):
+                problems.append("%s: missing (used by %s)" % (path, who))
+                continue
+            mode = os.stat(path).st_mode & 0o777
+            try:
+                with open(path) as fh:
+                    body = fh.read().strip()
+            except OSError as exc:
+                problems.append("%s: cannot read (%s)" % (path, exc))
+                continue
+            if not body:
+                problems.append("%s: empty (used by %s)" % (path, who))
+            elif mode != 0o600:
+                problems.append("%s: mode %o, want 600" % (path, mode))
+            else:
+                good_tokens.append(path)
+                notes.append("%s — %d bytes, mode 600" % (path, len(body)))
+        if problems:
+            d.bad("token file", "; ".join(problems),
+                  "\n    ".join("claude setup-token > %s && chmod 600 %s" % (p, p)
+                                for p in tokens))
+        else:
+            d.ok("token file", "; ".join(notes))
+        token_file = good_tokens[0] if good_tokens else tokens[0]
+
+        # 3 — ANTHROPIC_API_KEY must not be in the login environment (§9.2)
+        problems = []
+        rc, out, _ = launchctl("getenv", "ANTHROPIC_API_KEY")
+        if rc == 0 and out.strip():
+            problems.append("launchctl getenv ANTHROPIC_API_KEY is set "
+                            "(launchctl unsetenv ANTHROPIC_API_KEY)")
+        for rcfile in (".zshrc", ".zprofile", ".zshenv", ".bash_profile", ".profile"):
+            path = os.path.join(HOME, rcfile)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, errors="replace") as fh:
+                    for num, line in enumerate(fh, 1):
+                        bare = line.strip()
+                        if bare.startswith("#") or "ANTHROPIC_API_KEY" not in bare:
+                            continue
+                        if re.search(r"\b(export|set|setenv)\b.*ANTHROPIC_API_KEY|"
+                                     r"^ANTHROPIC_API_KEY=", bare):
+                            problems.append("~/%s:%d sets it" % (rcfile, num))
+            except OSError:
+                continue
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            problems.append("it is set in this shell's environment")
+        if problems:
+            d.bad("ANTHROPIC_API_KEY absent", "; ".join(problems),
+                  "An API key takes precedence over the subscription credential, so\n"
+                  "    the job would quietly bill Console credits instead of the Max plan.\n"
+                  "    Remove it from the login environment. (run.sh unsets it too.)")
+        else:
+            d.ok("ANTHROPIC_API_KEY absent",
+                 "not in launchctl env, shell rc files, or this shell")
+
+        # 4 — token is live
+        if quick:
+            d.skip("token is live", "skipped (--quick)")
+        elif not (good_tokens and good_bins):
+            d.skip("token is live", "skipped — no usable token/binary")
+        else:
+            env = stripped_env(token_file)
+            if "CLAUDE_CODE_OAUTH_TOKEN" not in env:
+                d.bad("token is live", "no token to test", "see the token file check")
+            else:
+                rc, out, error = run(
+                    [claude_bin, "-p", "reply with the single word: ok",
+                     "--model", "claude-haiku-4-5-20251001",
+                     "--permission-mode", "dontAsk", "--max-turns", "1",
+                     "--output-format", "json"],
+                    env=env, cwd=HOME, timeout=180)
+                data = None
+                try:
+                    data = json.loads(out)
+                except ValueError:
+                    pass
+                if isinstance(data, dict) and not data.get("is_error"):
+                    d.ok("token is live", "haiku replied: %r"
+                         % str(data.get("result", ""))[:40])
+                elif isinstance(data, dict):
+                    detail = redact(data.get("result", ""))[:240]
+                    remedy = ("the token is expired or revoked — regenerate:\n"
+                              "    claude setup-token > %s && chmod 600 %s"
+                              % (token_file, token_file))
+                    if "invalid value" in detail or "Authorization" in detail:
+                        remedy = ("the token was rejected as malformed, not expired —\n"
+                                  "    %s most likely contains a stray line break.\n"
+                                  "    Rewrite it on one line:\n"
+                                  "    claude setup-token | tr -d '[:space:]' > %s "
+                                  "&& chmod 600 %s" % (token_file, token_file, token_file))
+                    d.bad("token is live", detail, remedy)
+                else:
+                    d.bad("token is live", "no JSON result (rc=%d) %s"
+                          % (rc, redact((error or out).strip())[:240]),
+                          "run the same command by hand to see the failure")
+
+        # 5 — each job's REPO_DIR
+        if not cfgs:
+            d.skip("job repos", "no jobs defined")
+        else:
+            bad = []
+            for job, cfg in cfgs:
+                repo = cfg.get("REPO_DIR", "")
+                if not repo:
+                    bad.append("%s: REPO_DIR is empty" % job.name)
+                elif not os.path.isdir(repo):
+                    bad.append("%s: %s does not exist" % (job.name, repo))
+                elif not git_info(repo):
+                    bad.append("%s: %s is not a git repo" % (job.name, repo))
+            if bad:
+                d.bad("job repos", "; ".join(bad),
+                      "fix REPO_DIR in the job's run.sh (run.sh is the source of truth),\n"
+                      "    then `cjob show <job>` to confirm")
+            else:
+                d.ok("job repos", "%d repo(s) present and git-tracked" % len(cfgs))
+
+        # 6 — run.sh executable
+        if not jobs:
+            d.skip("run.sh executable", "no jobs defined")
+        else:
+            bad = [j.name for j in jobs if not os.access(j.run_sh, os.X_OK)]
+            if bad:
+                d.bad("run.sh executable", "not executable: %s" % ", ".join(bad),
+                      "chmod +x " + " ".join(
+                          os.path.join(AGENTS_DIR, n, "run.sh") for n in bad))
+            else:
+                d.ok("run.sh executable", "%d script(s) executable" % len(jobs))
+
+        # 7 — launchd agents match jobs
+        loaded_labels = set()
+        rc2, listing, _ = launchctl("list")
+        if rc2 == 0:
+            for line in listing.splitlines()[1:]:
+                bits = line.split()
+                if bits and bits[-1].startswith(LABEL_PREFIX):
+                    loaded_labels.add(bits[-1])
+        plist_labels = set()
+        try:
+            for name in os.listdir(LAUNCH_AGENTS):
+                if name.startswith(LABEL_PREFIX) and name.endswith(".plist"):
+                    plist_labels.add(name[:-len(".plist")])
+        except OSError:
+            pass
+        troubles = []
+        for job in jobs:
+            meta = job.meta()
+            if meta.get("enabled") and job.label not in loaded_labels:
+                troubles.append("%s is enabled in job.json but not loaded "
+                                "(cjob enable %s)" % (job.name, job.name))
+        known = {j.label for j in jobs}
+        for label in sorted(loaded_labels | plist_labels):
+            if label not in known:
+                troubles.append("orphan: %s has no job directory "
+                                "(launchctl bootout %s/%s; rm %s/%s.plist)"
+                                % (label, DOMAIN, label, LAUNCH_AGENTS, label))
+        if troubles:
+            d.bad("launchd agents", "; ".join(troubles), "see parentheses above")
+        else:
+            d.ok("launchd agents", "%d loaded, %d plist(s), no orphans"
+                 % (len(loaded_labels), len(plist_labels)))
+
+        # 8 — Full Disk Access for /bin/bash
+        probe = os.path.join(HOME, "Library", "Application Support",
+                             "com.apple.TCC", "TCC.db")
+        rc, out, error = run(["/bin/bash", "-c",
+                              'head -c 16 "$1" >/dev/null 2>&1 && echo yes || echo no',
+                              "_", probe])
+        if out.strip() == "yes":
+            d.ok("Full Disk Access", "/bin/bash can read TCC-protected paths")
+        else:
+            d.bad("Full Disk Access", "/bin/bash cannot read %s" % probe,
+                  "TCC will block a scheduled run from reading ~/Documents, ~/Desktop,\n"
+                  "    ~/Downloads and iCloud Drive. Grant it to /bin/bash (the plist\n"
+                  "    invokes /bin/bash, so the grant must be on the shell, not the repo):\n"
+                  "    " + FDA_HELP.replace("\n", "\n    ") + "\n"
+                  "    Caveat: this probe reflects the terminal running cjob. The\n"
+                  "    definitive test is one scheduled run that touches such a path.")
+
+        # 9 — pinned models (Claude jobs only — Jiva has no model-alias concept)
+        claude_cfgs = [(j, cfg) for j, cfg in cfgs if cfg.get("RUNNER", "claude") != "jiva"]
+        aliased = [(j.name, cfg.get("MODEL", ""))
+                   for j, cfg in claude_cfgs if cfg.get("MODEL", "") in MODEL_ALIASES]
+        if not claude_cfgs:
+            d.skip("models pinned", "no claude jobs defined")
+        elif aliased:
+            d.warn_("models pinned",
+                    "; ".join("%s uses the alias %r" % (n, m) for n, m in aliased),
+                    "Aliases resolve to a floating default that moves when Anthropic\n"
+                    "    ships a release, changing this job's behaviour and cost without\n"
+                    "    you touching anything. Pin a full ID, e.g. claude-sonnet-5.")
+        else:
+            d.ok("models pinned", "all %d claude job(s) pin a full model ID" % len(claude_cfgs))
+
+        # 10 — auto mode preconditions (§9.4)
+        auto_bad, auto_unknown, auto_ok_jobs = [], [], []
+        for job, cfg in cfgs:
+            if cfg.get("PERMISSION_MODE") != "auto":
+                continue
+            model = cfg.get("MODEL", "")
+            supported = auto_mode_supported(model)
+            if supported is True:
+                auto_ok_jobs.append(job.name)
+            elif supported is False:
+                auto_bad.append("%s: %s does not support auto mode" % (job.name, model))
+            else:
+                auto_unknown.append("%s: cannot verify %s supports auto mode"
+                                    % (job.name, model))
+        if not any(cfg.get("PERMISSION_MODE") == "auto" for _, cfg in cfgs):
+            d.ok("auto-mode model gating", "no job uses auto mode")
+        elif auto_bad:
+            d.bad("auto-mode model gating", "; ".join(auto_bad),
+                  "Auto mode needs Opus 4.6+, Sonnet 4.6+, or Fable 5. With an\n"
+                  "    unsupported model the job fails at startup, not gracefully at\n"
+                  "    runtime. Switch PERMISSION_MODE to dontAsk or pin a newer model.")
+        elif auto_unknown:
+            d.warn_("auto-mode model gating", "; ".join(auto_unknown),
+                    "verify the model supports auto mode (Opus 4.6+/Sonnet 4.6+/Fable 5)")
+        else:
+            d.ok("auto-mode model gating", "auto mode ok for: %s"
+                 % ", ".join(auto_ok_jobs))
+            print(dim("       under -p there is nobody to prompt, so repeated classifier\n"
+                      "       blocks abort the session; classifier calls also cost tokens"))
+
+        # 11 — is --max-turns actually honoured by this claude build?
+        rc, out, _ = run([claude_bin, "--help"], timeout=30)
+        if rc != 0:
+            d.skip("--max-turns honoured", "could not read `claude --help`")
+        elif "--max-turns" in out:
+            d.ok("--max-turns honoured", "advertised by claude --help")
+        else:
+            d.warn_("--max-turns honoured",
+                    "claude %s does not advertise --max-turns in --help"
+                    % (run([claude_bin, "--version"])[1].strip() or "?"),
+                    "The flag is accepted without error but is not documented in this\n"
+                    "    build, so do not rely on MAX_TURNS as a ceiling. MAX_BUDGET_USD\n"
+                    "    (--max-budget-usd) and TIMEOUT_SECONDS are the enforced limits.")
+
+        # 12/13/14 — jiva-runner jobs
+        jiva_cfgs = [(j, cfg) for j, cfg in cfgs if cfg.get("RUNNER") == "jiva"]
+        if not jiva_cfgs:
+            d.skip("jiva binary", "no jiva jobs defined")
+            d.skip("jiva config file", "no jiva jobs defined")
+            d.skip("jiva code-mode safety gate", "no jiva jobs defined")
+        else:
+            # 12 — jiva binary
+            jiva_bins = sorted({(cfg.get("JIVA_BIN") or DEFAULT_JIVA_BIN) for _, cfg in jiva_cfgs})
+            problems = []
+            for path in jiva_bins:
+                who = ", ".join(j.name for j, cfg in jiva_cfgs
+                                if (cfg.get("JIVA_BIN") or DEFAULT_JIVA_BIN) == path)
+                if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+                    problems.append("%s: not executable (used by %s)" % (path, who))
+                    continue
+                rc, out, _ = run([path, "--version"], timeout=30)
+                if rc != 0:
+                    problems.append("%s: `--version` failed rc=%d (used by %s)"
+                                    % (path, rc, who))
+            if problems:
+                d.bad("jiva binary", "; ".join(problems),
+                      "npm install -g jiva-core, or fix JIVA_BIN in the job's run.sh")
+            else:
+                d.ok("jiva binary", "%d bin(s) OK" % len(jiva_bins))
+
+            # 13 — jiva config file
+            jiva_configs = sorted({(cfg.get("JIVA_CONFIG_FILE") or DEFAULT_JIVA_CONFIG_FILE)
+                                   for _, cfg in jiva_cfgs})
+            problems, warnings_ = [], []
+            for path in jiva_configs:
+                who = ", ".join(j.name for j, cfg in jiva_cfgs
+                                if (cfg.get("JIVA_CONFIG_FILE") or DEFAULT_JIVA_CONFIG_FILE) == path)
+                if not os.path.isfile(path):
+                    problems.append("%s: missing (used by %s)" % (path, who))
+                    continue
+                try:
+                    with open(path) as fh:
+                        data = json.load(fh)
+                except (OSError, ValueError) as exc:
+                    problems.append("%s: invalid JSON (%s)" % (path, exc))
+                    continue
+                models = (data.get("models") or {}) if isinstance(data, dict) else {}
+                has_key = any((m or {}).get("apiKey") for m in models.values())
+                if not has_key:
+                    problems.append("%s: no model has a non-empty apiKey" % path)
+                    continue
+                mode = os.stat(path).st_mode & 0o777
+                if mode != 0o600:
+                    warnings_.append("%s: mode %o, recommend 600 (cjob doesn't own this "
+                                     "file — Jiva/jivam does)" % (path, mode))
+            if problems:
+                d.bad("jiva config file", "; ".join(problems),
+                      "run `jiva setup`, or fix JIVA_CONFIG_FILE in the job's run.sh")
+            elif warnings_:
+                d.warn_("jiva config file", "; ".join(warnings_), "chmod 600 the file(s) above")
+            else:
+                d.ok("jiva config file", "%d config(s) present with a usable apiKey"
+                     % len(jiva_configs))
+
+            # 14 — code-mode safety gate (informational, always WARN when any exist)
+            enabled_jiva = [j.name for j, _ in jiva_cfgs if j.meta().get("enabled")]
+            names = ", ".join(j.name for j, _ in jiva_cfgs)
+            d.warn_("jiva code-mode safety gate",
+                    "jiva job(s): %s%s" % (names,
+                        " (enabled: %s)" % ", ".join(enabled_jiva) if enabled_jiva else ""),
+                    "Jiva's --code mode has no workspace-boundary check on its write_file/\n"
+                    "    edit_file/bash tools — they can reach anywhere this user can, not just\n"
+                    "    each job's REPO_DIR. This is a Jiva limitation, not a cjob bug; only\n"
+                    "    keep jiva jobs enabled where that risk is acceptable.")
+
+        d.report()
+        if d.failures:
+            self.rc = 1
+
+    # ---- background services: web + tunnel ----
+    def do_web(self, arg):
+        """web start|stop|status|restart — the cjob-web control panel service."""
+        action = (shlex.split(arg)[0] if arg.strip() else "status").lower()
+        if action not in ("start", "stop", "status", "restart"):
+            return self.fail("usage: web start|stop|status|restart")
+
+        if action in ("stop", "restart"):
+            ok, error = service_bootout(WEB_LABEL)
+            if not ok:
+                return self.fail(error)
+            plist_path = service_plist_path(WEB_LABEL)
+            if os.path.exists(plist_path):
+                os.remove(plist_path)
+            if action == "stop":
+                print(green("stopped %s" % WEB_LABEL))
+
+        if action in ("start", "restart"):
+            if not os.path.isfile(WEB_SERVER_JS):
+                return self.fail("not found: %s (is .web/ set up?)" % WEB_SERVER_JS)
+            plist_path = write_service_plist(
+                WEB_LABEL, [NODE_BIN, WEB_SERVER_JS],
+                os.path.join(WEB_LOGS_DIR, "cjobweb.log"), extra_env={"HOME": HOME})
+            ok, error = service_bootstrap(WEB_LABEL, plist_path)
+            if not ok:
+                return self.fail(error)
+            print(green("started %s" % WEB_LABEL) + dim("  (port %d)" % WEB_PORT))
+
+        if action == "status":
+            loaded = agent_loaded(WEB_LABEL)
+            print("%s  %s" % (WEB_LABEL, green("loaded") if loaded else dim("not loaded")))
+            if loaded:
+                rc, out, _ = launchctl("print", "%s/%s" % (DOMAIN, WEB_LABEL))
+                if rc == 0:
+                    for key in ("state =", "pid ="):
+                        for line in out.splitlines():
+                            if key in line:
+                                print("  %s" % dim(line.strip()))
+                                break
+            health = http_get_json("http://localhost:%d/api/auth/status" % WEB_PORT)
+            if health is not None:
+                print("  %s http://localhost:%d  %s" % (
+                    green("responding"), WEB_PORT,
+                    dim("(needsSetup)" if health.get("needsSetup") else "")))
+            else:
+                print("  %s http://localhost:%d" % (red("not responding"), WEB_PORT))
+                if not loaded:
+                    self.rc = 1
+
+    def do_tunnel(self, arg):
+        """tunnel start|stop|status|restart — the ngrok tunnel onto cjob-web."""
+        action = (shlex.split(arg)[0] if arg.strip() else "status").lower()
+        if action not in ("start", "stop", "status", "restart"):
+            return self.fail("usage: tunnel start|stop|status|restart")
+
+        if action in ("stop", "restart"):
+            ok, error = service_bootout(TUNNEL_LABEL)
+            if not ok:
+                return self.fail(error)
+            plist_path = service_plist_path(TUNNEL_LABEL)
+            if os.path.exists(plist_path):
+                os.remove(plist_path)
+            if action == "stop":
+                print(green("stopped %s" % TUNNEL_LABEL))
+
+        if action in ("start", "restart"):
+            if not (os.path.isfile(NGROK_BIN) and os.access(NGROK_BIN, os.X_OK)):
+                return self.fail("ngrok not executable: %s" % NGROK_BIN)
+            plist_path = write_service_plist(
+                TUNNEL_LABEL, [NGROK_BIN, "http", str(WEB_PORT), "--log=stdout"],
+                os.path.join(WEB_LOGS_DIR, "cjobtunnel.log"), extra_env={"HOME": HOME})
+            ok, error = service_bootstrap(TUNNEL_LABEL, plist_path)
+            if not ok:
+                return self.fail(error)
+            print(green("started %s" % TUNNEL_LABEL))
+
+        if action == "status":
+            loaded = agent_loaded(TUNNEL_LABEL)
+            print("%s  %s" % (TUNNEL_LABEL, green("loaded") if loaded else dim("not loaded")))
+            data = http_get_json("http://127.0.0.1:4040/api/tunnels")
+            tunnels = (data or {}).get("tunnels") or []
+            https = [t for t in tunnels if t.get("proto") == "https"]
+            if https:
+                print("  %s %s" % (green("public URL:"), bold(https[0].get("public_url", "?"))))
+            elif tunnels:
+                print("  %s %s" % (green("public URL:"), bold(tunnels[0].get("public_url", "?"))))
+            else:
+                print("  %s" % (dim("no active tunnel found on 127.0.0.1:4040")
+                                if loaded else red("not running")))
+                if loaded:
+                    self.rc = 1
+
+    # ---- misc ----
+    def do_quit(self, arg):
+        """quit — leave the REPL."""
+        return True
+
+    do_exit = do_quit
+    do_q = do_quit
+
+    def do_EOF(self, arg):
+        print()
+        return True
+
+    def do_help(self, arg):
+        if arg:
+            return super().do_help(arg)
+        print(bold("\ncommands"))
+        rows = [
+            ["ls", "list jobs with schedule, model, last-run status"],
+            ["show <job>", "full detail: config, repo, prompt, plist, last 5 runs"],
+            ["new", "wizard: scaffold a job (does not enable it)"],
+            ["edit <job> [prompt|script|config]", "open a job file in $EDITOR"],
+            ["run <job>", "run now in the foreground with a stripped env"],
+            ["logs <job> [--date YYYY-MM-DD]", "list runs for a date"],
+            ["log <job> [<date> <time>]", "print one log (bare = latest)"],
+            ["tail <job>", "follow the newest log live"],
+            ["enable <job>", "bootstrap the launchd agent"],
+            ["disable <job>", "bootout the launchd agent"],
+            ["schedule <job> <spec>", "set fire times, then reload if enabled"],
+            ["usage [<job>] [--days N]", "aggregate cost and turns"],
+            ["rm <job>", "disable and delete, with typed confirmation"],
+            ["doctor [--quick]", "health check"],
+            ["web start|stop|status|restart", "the cjob-web control panel background service"],
+            ["tunnel start|stop|status|restart", "the ngrok tunnel onto cjob-web"],
+            ["help, quit", ""],
+        ]
+        table([["  " + a, b] for a, b in rows], ["  COMMAND", "WHAT IT DOES"])
+        print(dim("\n  " + SCHEDULE_HELP))
+        print()
+
+
+# ─────────────────────────── doctor plumbing ──────────────────────────
+
+class Doctor:
+    def __init__(self):
+        self.results = []
+        self.failures = 0
+        self.warnings = 0
+
+    def _emit(self, tag, name, detail, remedy=None):
+        print("%s %s" % (tag, bold(name)))
+        if detail:
+            print("       %s" % detail)
+        if remedy:
+            print("    %s %s" % (yellow("fix:"), remedy))
+
+    def ok(self, name, detail=""):
+        self.results.append(("PASS", name))
+        self._emit(green("PASS"), name, dim(detail))
+
+    def bad(self, name, detail, remedy):
+        self.failures += 1
+        self.results.append(("FAIL", name))
+        self._emit(red("FAIL"), name, detail, remedy)
+
+    def warn_(self, name, detail, remedy):
+        self.warnings += 1
+        self.results.append(("WARN", name))
+        self._emit(yellow("WARN"), name, detail, remedy)
+
+    def skip(self, name, detail=""):
+        self.results.append(("SKIP", name))
+        self._emit(dim("SKIP"), name, dim(detail))
+
+    def report(self):
+        passed = sum(1 for s, _ in self.results if s == "PASS")
+        print()
+        summary = "%d passed, %d failed, %d warning(s)" % (
+            passed, self.failures, self.warnings)
+        print(bold(red(summary)) if self.failures else
+              (bold(yellow(summary)) if self.warnings else bold(green(summary))))
+
+
+# ─────────────────────────── scaffolding ──────────────────────────────
+
+def write_run_sh(job, values, template_name="run.sh.tmpl"):
+    with open(os.path.join(TEMPLATES, template_name)) as fh:
+        tmpl = fh.read()
+    extra = values.get("EXTRA_DIRS") or []
+    subs = dict(values)
+    subs["EXTRA_DIRS"] = " ".join('"%s"' % d for d in extra)
+    for key, val in subs.items():
+        tmpl = tmpl.replace("@@%s@@" % key, str(val))
+    left = re.findall(r"@@([A-Z_]+)@@", tmpl)
+    if left:
+        raise ValueError("run.sh template has unsubstituted placeholders: %s"
+                         % ", ".join(sorted(set(left))))
+    with open(job.run_sh, "w") as fh:
+        fh.write(tmpl)
+    os.chmod(job.run_sh, 0o755)
+
+
+def write_plist(job, entries):
+    with open(os.path.join(TEMPLATES, "launchd.plist.tmpl")) as fh:
+        tmpl = fh.read()
+    body = (tmpl.replace("@@LABEL@@", job.label)
+                .replace("@@RUN_SH@@", job.run_sh)
+                .replace("@@LOG_ROOT@@", job.logs_dir)
+                .replace("@@CALENDAR@@", render_calendar(entries)))
+    os.makedirs(LAUNCH_AGENTS, exist_ok=True)
+    os.makedirs(job.logs_dir, exist_ok=True)
+    tmp = job.plist + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(body)
+    rc, _, error = run(["plutil", "-lint", tmp])
+    if rc != 0:
+        os.remove(tmp)
+        raise ValueError("generated plist is invalid: %s" % error.strip())
+    os.replace(tmp, job.plist)
+    return job.plist
+
+
+# ─────────────────────────── background services ──────────────────────
+# cjob-web + its ngrok tunnel: fixed singletons (not per-job), so no
+# template substitution — generated inline, same tmp/plutil-lint/atomic-
+# rename safety as write_plist above. RunAtLoad+KeepAlive (not
+# StartCalendarInterval — these run continuously, not on a schedule),
+# mirroring the same pattern already used by this machine's own
+# ai.karmaloop.jivam launchd agent.
+
+def service_plist_path(label):
+    return os.path.join(LAUNCH_AGENTS, label + ".plist")
+
+
+def write_service_plist(label, program_args, log_path, extra_env=None):
+    os.makedirs(LAUNCH_AGENTS, exist_ok=True)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    args_xml = "".join("    <string>%s</string>\n" % a for a in program_args)
+    env_xml = ""
+    if extra_env:
+        entries = "".join(
+            "    <key>%s</key><string>%s</string>\n" % (k, v) for k, v in extra_env.items()
+        )
+        env_xml = "  <key>EnvironmentVariables</key>\n  <dict>\n%s  </dict>\n" % entries
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        "<dict>\n"
+        "  <key>Label</key><string>%s</string>\n"
+        "  <key>ProgramArguments</key>\n"
+        "  <array>\n%s  </array>\n"
+        "  <key>RunAtLoad</key><true/>\n"
+        "  <key>KeepAlive</key><true/>\n"
+        "  <key>ThrottleInterval</key><integer>5</integer>\n"
+        "  <key>StandardOutPath</key><string>%s</string>\n"
+        "  <key>StandardErrorPath</key><string>%s</string>\n"
+        "%s"
+        "</dict>\n"
+        "</plist>\n"
+    ) % (label, args_xml, log_path, log_path, env_xml)
+
+    plist_path = service_plist_path(label)
+    tmp = plist_path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(body)
+    rc, _, error = run(["plutil", "-lint", tmp])
+    if rc != 0:
+        os.remove(tmp)
+        raise ValueError("generated plist is invalid: %s" % error.strip())
+    os.replace(tmp, plist_path)
+    return plist_path
+
+
+def service_bootstrap(label, plist_path):
+    """(Re)load a background service, reloading if already loaded so the
+    current plist takes effect — same reload semantics as do_enable."""
+    if agent_loaded(label):
+        launchctl("bootout", "%s/%s" % (DOMAIN, label))
+    rc, out, error = launchctl("bootstrap", DOMAIN, plist_path)
+    if rc != 0:
+        rc, out, error = launchctl("load", "-w", plist_path)
+        if rc != 0:
+            return False, ("launchctl bootstrap/load failed (rc=%d): %s"
+                           % (rc, (error or out).strip() or "no output"))
+    if not agent_loaded(label):
+        return False, "launchctl reported success but %s is not loaded" % label
+    return True, None
+
+
+def service_bootout(label):
+    if not agent_loaded(label):
+        return True, None
+    rc, out, error = launchctl("bootout", "%s/%s" % (DOMAIN, label))
+    if rc != 0:
+        rc, out, error = launchctl("unload", "-w", service_plist_path(label))
+        if rc != 0:
+            return False, ("launchctl bootout/unload failed (rc=%d): %s"
+                           % (rc, (error or out).strip() or "no output"))
+    return True, None
+
+
+def http_get_json(url, timeout=3):
+    """Best-effort local HTTP GET returning parsed JSON, or None on any
+    failure (connection refused, timeout, non-JSON body, ...)."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+
+
+# ─────────────────────────── entrypoint ───────────────────────────────
+
+HISTFILE = os.path.join(JOBS_ROOT, ".state", "cjob.history")
+
+
+def main(argv):
+    if not os.path.isdir(JOBS_ROOT):
+        err("%s does not exist" % JOBS_ROOT)
+        return 2
+    os.makedirs(os.path.dirname(HISTFILE), exist_ok=True)
+    shell = Cjob()
+
+    if argv:
+        line = " ".join(shlex.quote(a) for a in argv)
+        try:
+            shell.onecmd(line)
+        except KeyboardInterrupt:
+            print()
+            return 130
+        return shell.rc
+
+    if readline is not None:
+        try:
+            readline.read_history_file(HISTFILE)
+        except OSError:
+            pass
+        readline.set_history_length(2000)
+    try:
+        while True:
+            try:
+                shell.cmdloop()
+                break
+            except KeyboardInterrupt:
+                print("\n" + dim("^C  (type `quit` to exit)"))
+                shell.intro = None
+    finally:
+        if readline is not None:
+            try:
+                readline.write_history_file(HISTFILE)
+            except OSError:
+                pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

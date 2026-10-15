@@ -1,0 +1,419 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────
+#  CONFIG — edit anything in this block
+# ─────────────────────────────────────────────────────────────
+
+JOB_NAME="@@JOB_NAME@@"
+
+# The repo Claude runs inside. Its CLAUDE.md / .claude/ dir is the "brain".
+REPO_DIR="@@REPO_DIR@@"
+
+# Extra directories Claude may read/write (space-separated, may be empty).
+EXTRA_DIRS=(@@EXTRA_DIRS@@)
+
+# Model — PIN A FULL ID, not an alias. Aliases float across releases and
+# will change this job's behavior and cost without you touching anything.
+MODEL="@@MODEL@@"
+
+# Permission mode: auto | dontAsk | acceptEdits | bypassPermissions
+PERMISSION_MODE="@@PERMISSION_MODE@@"
+
+# Hard ceilings. These are the load-bearing part of "predictable usage".
+MAX_TURNS=@@MAX_TURNS@@
+MAX_BUDGET_USD=@@MAX_BUDGET_USD@@
+
+# Optional extra allow-rules layered on top of the permission mode.
+ALLOWED_TOOLS="@@ALLOWED_TOOLS@@"          # e.g. "Read,Grep,Glob,Bash(git log:*)"
+DISALLOWED_TOOLS="@@DISALLOWED_TOOLS@@"       # e.g. "Bash(git push:*),WebFetch"
+
+# Wall-clock kill switch, seconds. 0 disables.
+TIMEOUT_SECONDS=@@TIMEOUT_SECONDS@@
+
+# Retention: delete log date-directories older than this many days. 0 disables.
+LOG_RETENTION_DAYS=@@LOG_RETENTION_DAYS@@
+
+# Appended to the hermetic PATH. Needed if the job's tools live outside
+# /usr/bin:/bin (e.g. gh in /usr/local/bin, node from nvm). Keep it explicit —
+# a scheduled run does NOT inherit your shell's PATH.
+PATH_EXTRA="@@PATH_EXTRA@@"
+
+# Where the token lives (chmod 600).
+TOKEN_FILE="@@TOKEN_FILE@@"
+
+CLAUDE_BIN="@@CLAUDE_BIN@@"
+
+# ─────────────────────────────────────────────────────────────
+#  END CONFIG — you shouldn't need to edit below here
+# ─────────────────────────────────────────────────────────────
+
+# Deliberately NOT `set -e`: we must always reach the footer-writing and
+# lock-release code, including when `claude` exits non-zero.
+set -uo pipefail
+
+JOB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# ── Hermetic environment ─────────────────────────────────────
+export PATH="/Users/abi/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+[ -n "$PATH_EXTRA" ] && export PATH="$PATH:$PATH_EXTRA"
+export HOME="/Users/abi"
+
+# §9.2: an API key in the environment silently takes precedence over the
+# subscription credential and bills Console credits instead of the Max plan.
+unset ANTHROPIC_API_KEY
+
+LOCK_DIR="$JOB_DIR/state/run.lock"
+OWN_LOCK=0
+KILL_MARKER="$JOB_DIR/state/.killed.$$"
+LOG_FILE=""
+
+mkdir -p "$JOB_DIR/state" "$JOB_DIR/logs"
+
+cleanup() {
+  # Do not orphan claude. If run.sh is killed, its child would otherwise
+  # keep running unattended and keep consuming plan quota.
+  if [ -n "${CLAUDE_PID:-}" ] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    kill -TERM "$CLAUDE_PID" 2>/dev/null
+  fi
+  [ -n "${WATCHDOG_PID:-}" ] && kill "$WATCHDOG_PID" 2>/dev/null
+  [ "$OWN_LOCK" = "1" ] && rm -rf "$LOCK_DIR"
+  rm -f "$KILL_MARKER"
+  return 0
+}
+trap cleanup EXIT
+# An untrapped signal would kill the shell without running the EXIT trap,
+# leaving the lock behind. Trap them so cleanup always runs.
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+# say <text> — to the log if it exists, and to stdout when someone is watching
+# (`cjob run`). Under launchd stdout lands in logs/launchd.out.
+say() {
+  if [ -n "$LOG_FILE" ]; then printf '%s\n' "$*" >>"$LOG_FILE"; fi
+  if [ -t 1 ]; then printf '%s\n' "$*"; fi
+}
+
+# die <text> — before the log exists this goes to stderr, i.e. launchd.err.
+die() {
+  printf '[%s] %s: FATAL: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$JOB_NAME" "$*" >&2
+  if [ -n "$LOG_FILE" ]; then
+    printf '[%s] FATAL: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$LOG_FILE"
+  fi
+  exit 78
+}
+
+# ── Token ────────────────────────────────────────────────────
+[ -f "$TOKEN_FILE" ] || die "token file not found: $TOKEN_FILE
+  Create it with:  claude setup-token > $TOKEN_FILE && chmod 600 $TOKEN_FILE"
+CLAUDE_CODE_OAUTH_TOKEN="$(tr -d '[:space:]' <"$TOKEN_FILE")"
+[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || die "token file is empty: $TOKEN_FILE
+  Regenerate with: claude setup-token > $TOKEN_FILE && chmod 600 $TOKEN_FILE"
+export CLAUDE_CODE_OAUTH_TOKEN
+
+[ -x "$CLAUDE_BIN" ] || die "claude binary not executable: $CLAUDE_BIN"
+[ -f "$JOB_DIR/prompt.md" ] || die "prompt not found: $JOB_DIR/prompt.md"
+PROMPT_TEXT="$(cat "$JOB_DIR/prompt.md")"
+[ -n "${PROMPT_TEXT//[[:space:]]/}" ] || die "prompt.md is empty: $JOB_DIR/prompt.md"
+
+# ── Lock (§9.5 — no flock on macOS; mkdir is atomic) ─────────
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo $$ >"$LOCK_DIR/pid"
+    OWN_LOCK=1
+    return 0
+  fi
+  # Held — or stale. Stale-lock reclamation is mandatory: without it one hard
+  # reboot mid-run disables the job permanently and silently.
+  local holder=""
+  [ -f "$LOCK_DIR/pid" ] && holder="$(head -1 "$LOCK_DIR/pid" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    return 1
+  fi
+  rm -rf "$LOCK_DIR" 2>/dev/null
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo $$ >"$LOCK_DIR/pid"
+    # Guard against two reclaimers racing: only the one whose pid survived wins.
+    if [ "$(head -1 "$LOCK_DIR/pid" 2>/dev/null | tr -d '[:space:]')" = "$$" ]; then
+      OWN_LOCK=1
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# ── Log paths — one timestamp, so .log and .result.json can't straddle a
+#    second boundary and end up with mismatched names. Local time, not UTC.
+STAMP_DATE="$(date '+%Y-%m-%d')"
+STAMP_TIME="$(date '+%H-%M-%S')"
+LOG_DIR="$JOB_DIR/logs/$STAMP_DATE"
+mkdir -p "$LOG_DIR" || die "cannot create log dir: $LOG_DIR"
+LOG_FILE="$LOG_DIR/$STAMP_TIME.log"
+RESULT_FILE="${LOG_FILE%.log}.result.json"
+
+if ! acquire_lock; then
+  HOLDER="$(head -1 "$LOCK_DIR/pid" 2>/dev/null | tr -d '[:space:]')"
+  printf '[%s] SKIPPED: already running (pid %s), lock %s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${HOLDER:-unknown}" "$LOCK_DIR" >>"$LOG_FILE"
+  [ -t 1 ] && printf 'SKIPPED: %s already running (pid %s)\n' "$JOB_NAME" "${HOLDER:-unknown}"
+  # A skipped run is not a failure.
+  exit 0
+fi
+
+# ── Repo ─────────────────────────────────────────────────────
+[ -d "$REPO_DIR" ] || die "REPO_DIR does not exist: $REPO_DIR"
+GIT_BRANCH="$(cd "$REPO_DIR" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+GIT_SHA="$(cd "$REPO_DIR" 2>/dev/null && git rev-parse --short HEAD 2>/dev/null)"
+GIT_DIRTY=""
+if [ -n "$(cd "$REPO_DIR" 2>/dev/null && git status --porcelain 2>/dev/null)" ]; then
+  GIT_DIRTY=" (dirty)"
+fi
+CLAUDE_VERSION="$("$CLAUDE_BIN" --version 2>/dev/null | head -1)"
+
+# ── Header — this is what makes a six-month-old log interpretable ─────
+START_ISO="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+START_EPOCH="$(date '+%s')"
+{
+  echo "═══════════════════════════════════════════════════════════════"
+  echo " job          : $JOB_NAME"
+  echo " started      : $START_ISO"
+  echo " model        : $MODEL"
+  echo " permission   : $PERMISSION_MODE"
+  echo " max turns    : $MAX_TURNS"
+  echo " max budget   : \$$MAX_BUDGET_USD (est. API-equivalent)"
+  echo " timeout      : ${TIMEOUT_SECONDS}s"
+  echo " repo         : $REPO_DIR"
+  echo " git          : ${GIT_BRANCH:-?} @ ${GIT_SHA:-?}${GIT_DIRTY}"
+  echo " claude       : ${CLAUDE_VERSION:-?} ($CLAUDE_BIN)"
+  echo " allowedTools : ${ALLOWED_TOOLS:-<none>}"
+  echo " disallowed   : ${DISALLOWED_TOOLS:-<none>}"
+  echo " extra dirs   : ${EXTRA_DIRS[*]+${EXTRA_DIRS[*]}}"
+  echo " PATH         : $PATH"
+  echo " log          : $LOG_FILE"
+  echo "═══════════════════════════════════════════════════════════════"
+} >>"$LOG_FILE"
+[ -t 1 ] && sed -n '1,17p' "$LOG_FILE"
+
+# Running *inside* the repo is how Claude picks up CLAUDE.md and
+# .claude/skills/. Do not try to inject the brain files via the prompt.
+cd "$REPO_DIR" || die "cannot cd to REPO_DIR: $REPO_DIR"
+
+# ── Build the argv ───────────────────────────────────────────
+ADD_DIR_ARGS=()
+for d in ${EXTRA_DIRS[@]+"${EXTRA_DIRS[@]}"}; do
+  [ -n "$d" ] && ADD_DIR_ARGS+=(--add-dir "$d")
+done
+
+CLAUDE_ARGS=(
+  -p "$PROMPT_TEXT"
+  --model "$MODEL"
+  --permission-mode "$PERMISSION_MODE"
+  --max-turns "$MAX_TURNS"
+  --max-budget-usd "$MAX_BUDGET_USD"
+  --output-format json
+)
+[ -n "$ALLOWED_TOOLS" ]    && CLAUDE_ARGS+=(--allowedTools "$ALLOWED_TOOLS")
+[ -n "$DISALLOWED_TOOLS" ] && CLAUDE_ARGS+=(--disallowedTools "$DISALLOWED_TOOLS")
+CLAUDE_ARGS+=(${ADD_DIR_ARGS[@]+"${ADD_DIR_ARGS[@]}"})
+
+say ""
+say "──── invoking claude ────"
+
+: >"$RESULT_FILE"
+"$CLAUDE_BIN" "${CLAUDE_ARGS[@]}" >"$RESULT_FILE" 2>>"$LOG_FILE" </dev/null &
+CLAUDE_PID=$!
+
+# ── Watchdog (§: macOS has no timeout(1)) ────────────────────
+WATCHDOG_PID=""
+if [ "$TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null; then
+  (
+    slept=0
+    while [ "$slept" -lt "$TIMEOUT_SECONDS" ]; do
+      kill -0 "$CLAUDE_PID" 2>/dev/null || exit 0
+      sleep 5
+      slept=$((slept + 5))
+    done
+    if kill -0 "$CLAUDE_PID" 2>/dev/null; then
+      : >"$KILL_MARKER"
+      kill -TERM "$CLAUDE_PID" 2>/dev/null
+      sleep 10
+      kill -KILL "$CLAUDE_PID" 2>/dev/null
+    fi
+  ) &
+  WATCHDOG_PID=$!
+fi
+
+# Redirect the wait: bash otherwise prints its own async "Terminated"
+# notice to stderr when the watchdog signals claude.
+wait "$CLAUDE_PID" 2>/dev/null
+EXIT_CODE=$?
+if [ -n "$WATCHDOG_PID" ]; then
+  # `wait` inside the redirect swallows bash's async "Terminated" notice.
+  { kill "$WATCHDOG_PID" && wait "$WATCHDOG_PID"; } 2>/dev/null
+fi
+KILLED=0
+[ -f "$KILL_MARKER" ] && KILLED=1
+
+END_EPOCH="$(date '+%s')"
+DURATION=$((END_EPOCH - START_EPOCH))
+
+# ── Footer. Parse with python3, not grep/sed — the result text is free-form
+#    model output and will contain braces and quotes. ─────────
+python3 - "$RESULT_FILE" "$LOG_FILE" "$JOB_DIR/state/last-run.json" \
+  "$EXIT_CODE" "$DURATION" "$KILLED" "$START_ISO" "$JOB_NAME" "$MODEL" \
+  "$PERMISSION_MODE" "$REPO_DIR" "${GIT_BRANCH:-}" "${GIT_SHA:-}" <<'PY'
+import json, sys, os
+
+(result_file, log_file, last_run_file, exit_code, duration, killed,
+ started, job, model, mode, repo, branch, sha) = sys.argv[1:14]
+exit_code, duration, killed = int(exit_code), int(duration), int(killed)
+
+raw = ""
+try:
+    with open(result_file) as fh:
+        raw = fh.read()
+except OSError:
+    pass
+
+data, parse_err = None, None
+if raw.strip():
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        parse_err = str(exc)
+        # stream-json leftovers: try the last complete JSON line
+        for line in reversed(raw.strip().splitlines()):
+            try:
+                cand = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(cand, dict):
+                data, parse_err = cand, None
+                break
+else:
+    parse_err = "result file is empty (claude produced no JSON)"
+
+if not isinstance(data, dict):
+    data = {}
+
+def g(key, default=None):
+    v = data.get(key)
+    return default if v is None else v
+
+summary = {
+    "job": job,
+    "started": started,
+    "exit_code": exit_code,
+    "duration_seconds": duration,
+    "killed_by_watchdog": bool(killed),
+    "is_error": bool(g("is_error", exit_code != 0)),
+    "num_turns": g("num_turns"),
+    "total_cost_usd": g("total_cost_usd"),
+    "session_id": g("session_id"),
+    "subtype": g("subtype"),
+    "terminal_reason": g("terminal_reason"),
+    "stop_reason": g("stop_reason"),
+    "model": model,
+    "permission_mode": mode,
+    "repo": repo,
+    "git_branch": branch,
+    "git_sha": sha,
+    "log": log_file,
+    "result": result_file,
+    "parse_error": parse_err,
+}
+if not summary["is_error"] and killed:
+    summary["is_error"] = True
+
+out = []
+if data:
+    out.append("")
+    out.append("──── result json ────")
+    out.append(json.dumps(data, indent=2, sort_keys=True))
+if parse_err:
+    out.append("")
+    out.append("──── result json UNPARSEABLE ────")
+    out.append("error: %s" % parse_err)
+    if raw.strip():
+        out.append("raw (first 4000 chars):")
+        out.append(raw[:4000])
+
+text = g("result")
+if isinstance(text, str) and text.strip():
+    out.append("")
+    out.append("──── claude's final message ────")
+    out.append(text.rstrip())
+
+why = "exited on its own"
+if killed:
+    why = "KILLED BY WATCHDOG (wall-clock timeout)"
+elif exit_code < 0 or exit_code > 128:
+    why = "terminated by signal %d" % (exit_code - 128)
+
+cost = summary["total_cost_usd"]
+cost_s = "n/a" if cost is None else ("%.4f" % cost)
+
+out.append("")
+out.append("──────────────────────── RUN FOOTER ────────────────────────")
+out.append("cjob.exit_code=%d" % exit_code)
+out.append("cjob.duration_seconds=%d" % duration)
+out.append("cjob.killed_by_watchdog=%s" % ("yes" if killed else "no"))
+out.append("cjob.termination=%s" % why)
+out.append("cjob.is_error=%s" % ("true" if summary["is_error"] else "false"))
+out.append("cjob.num_turns=%s" % ("" if summary["num_turns"] is None else summary["num_turns"]))
+out.append("cjob.total_cost_usd=%s" % ("" if cost is None else cost))
+out.append("cjob.session_id=%s" % (summary["session_id"] or ""))
+out.append("cjob.subtype=%s" % (summary["subtype"] or ""))
+out.append("cjob.terminal_reason=%s" % (summary["terminal_reason"] or ""))
+out.append("cjob.finished=%s" % __import__("time").strftime("%Y-%m-%dT%H:%M:%S%z"))
+out.append("──────────────────────── END FOOTER ────────────────────────")
+out.append("%s in %ds — %s | turns=%s | est. API-equivalent $%s%s" % (
+    "FAILED" if summary["is_error"] else "OK",
+    duration, why,
+    "?" if summary["num_turns"] is None else summary["num_turns"],
+    cost_s,
+    "" if not summary["session_id"] else " | session %s" % summary["session_id"],
+))
+
+blob = "\n".join(out) + "\n"
+with open(log_file, "a") as fh:
+    fh.write(blob)
+
+tmp = last_run_file + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(summary, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+os.replace(tmp, last_run_file)
+
+# Echo the tail to stdout when a human is watching.
+if sys.stdout.isatty():
+    sys.stdout.write("\n".join(out[-16:]) + "\n")
+PY
+
+# ── Retention ────────────────────────────────────────────────
+if [ "$LOG_RETENTION_DAYS" -gt 0 ] 2>/dev/null; then
+  python3 - "$JOB_DIR/logs" "$LOG_RETENTION_DAYS" "$LOG_FILE" <<'PY'
+import datetime, os, shutil, sys
+root, days, log_file = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+cutoff = datetime.date.today() - datetime.timedelta(days=days)
+removed = []
+try:
+    names = sorted(os.listdir(root))
+except OSError:
+    names = []
+for name in names:
+    path = os.path.join(root, name)
+    if not os.path.isdir(path):
+        continue
+    try:
+        day = datetime.datetime.strptime(name, "%Y-%m-%d").date()
+    except ValueError:
+        continue
+    if day < cutoff:
+        shutil.rmtree(path, ignore_errors=True)
+        removed.append(name)
+if removed:
+    with open(log_file, "a") as fh:
+        fh.write("pruned log dirs older than %d days: %s\n" % (days, ", ".join(removed)))
+PY
+fi
+
+exit "$EXIT_CODE"

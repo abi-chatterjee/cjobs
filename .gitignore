@@ -1,0 +1,23 @@
+# Every job/agent lives under .agents/ — its name, prompt, logs and target repo
+# path identify real projects, and this repo is public. Ignore it wholesale so no
+# individual job name ever has to appear in this file.
+.agents/
+
+# Local CLI state: wizard defaults (include repo paths) and REPL history
+.state/
+
+# cjob-web runtime
+.web/logs/
+.web/.state/
+node_modules/
+
+# Secrets (the real ones live in ~/.secrets, outside this tree — belt and braces)
+.env
+.env.*
+*.pem
+*.key
+
+# Python / macOS
+__pycache__/
+*.pyc
+.DS_Store

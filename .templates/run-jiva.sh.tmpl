@@ -1,0 +1,400 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────
+#  CONFIG — edit anything in this block
+# ─────────────────────────────────────────────────────────────
+
+JOB_NAME="@@JOB_NAME@@"
+
+# This job runs via Jiva, not Claude Code. RUNNER is read by cjob to pick the
+# right doctor checks / config-key display — don't remove it.
+RUNNER="jiva"
+
+# The workspace Jiva runs inside (passed as --workspace). Jiva's --code mode
+# has NO workspace-boundary enforcement of its own: its write_file/edit_file/
+# bash tools can reach any path this user can, not just this directory. Only
+# point this at a repo where that's an acceptable risk — same caution as
+# Claude's bypassPermissions mode.
+REPO_DIR="@@REPO_DIR@@"
+
+# Iteration cap for Jiva's --code mode agent loop (its own default is 50 if
+# unset; cjob always passes an explicit value for predictability).
+JIVA_MAX_ITERATIONS=@@JIVA_MAX_ITERATIONS@@
+
+# Jiva's own config file (model + apiKey + mcpServers) — analogous to
+# Claude's TOKEN_FILE. Defaults to Jiva's own global config; point this at a
+# dedicated file if you want a job to use different credentials/model.
+JIVA_CONFIG_FILE="@@JIVA_CONFIG_FILE@@"
+
+# Optional directive file (Jiva's CLAUDE.md-equivalent standing context).
+# Leave blank to let Jiva auto-discover one (checks jiva-directive.md, then
+# CLAUDE.md, then AGENTS.md in REPO_DIR).
+JIVA_DIRECTIVE_FILE="@@JIVA_DIRECTIVE_FILE@@"
+
+# Optional cost estimate — Jiva has no cost API (it's provider-agnostic), so
+# cjob can only compute a cost if you supply your provider's per-token price
+# here. Leave either blank to skip cost computation entirely (turns/tokens
+# still get recorded).
+JIVA_INPUT_PRICE_PER_1M="@@JIVA_INPUT_PRICE_PER_1M@@"
+JIVA_OUTPUT_PRICE_PER_1M="@@JIVA_OUTPUT_PRICE_PER_1M@@"
+
+# Wall-clock kill switch, seconds. 0 disables. NOTE: Jiva's CLI has no
+# SIGTERM handler today, so a watchdog kill here terminates it immediately
+# rather than letting it clean up its own MCP child processes — this bounds
+# wall-clock time but is not as clean a shutdown as Claude's run.sh gets.
+TIMEOUT_SECONDS=@@TIMEOUT_SECONDS@@
+
+# Retention: delete log date-directories older than this many days. 0 disables.
+LOG_RETENTION_DAYS=@@LOG_RETENTION_DAYS@@
+
+# Appended to the hermetic PATH. Must include the directory `jiva` (and the
+# `node`/`npx` it needs) actually live in — a scheduled run does NOT inherit
+# your shell's PATH.
+PATH_EXTRA="@@PATH_EXTRA@@"
+
+JIVA_BIN="@@JIVA_BIN@@"
+
+# ─────────────────────────────────────────────────────────────
+#  END CONFIG — you shouldn't need to edit below here
+# ─────────────────────────────────────────────────────────────
+
+# Deliberately NOT `set -e`: we must always reach the footer-writing and
+# lock-release code, including when `jiva` exits non-zero.
+set -uo pipefail
+
+JOB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# ── Hermetic environment ─────────────────────────────────────
+export PATH="/Users/abi/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+[ -n "$PATH_EXTRA" ] && export PATH="$PATH:$PATH_EXTRA"
+export HOME="/Users/abi"
+
+# Harmless for Jiva (auth lives in JIVA_CONFIG_FILE, not this env var) but
+# kept for hygiene/consistency with the Claude runner's hermetic environment.
+unset ANTHROPIC_API_KEY
+
+LOCK_DIR="$JOB_DIR/state/run.lock"
+OWN_LOCK=0
+KILL_MARKER="$JOB_DIR/state/.killed.$$"
+LOG_FILE=""
+
+mkdir -p "$JOB_DIR/state" "$JOB_DIR/logs"
+
+cleanup() {
+  # Do not orphan jiva. If run.sh is killed, its child would otherwise keep
+  # running unattended. Jiva's CLI has no SIGTERM handler of its own, so this
+  # is a hard stop, not a graceful one — see the TIMEOUT_SECONDS note above.
+  if [ -n "${JIVA_PID:-}" ] && kill -0 "$JIVA_PID" 2>/dev/null; then
+    kill -TERM "$JIVA_PID" 2>/dev/null
+  fi
+  [ -n "${WATCHDOG_PID:-}" ] && kill "$WATCHDOG_PID" 2>/dev/null
+  [ "$OWN_LOCK" = "1" ] && rm -rf "$LOCK_DIR"
+  rm -f "$KILL_MARKER"
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+say() {
+  if [ -n "$LOG_FILE" ]; then printf '%s\n' "$*" >>"$LOG_FILE"; fi
+  if [ -t 1 ]; then printf '%s\n' "$*"; fi
+}
+
+die() {
+  printf '[%s] %s: FATAL: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$JOB_NAME" "$*" >&2
+  if [ -n "$LOG_FILE" ]; then
+    printf '[%s] FATAL: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$LOG_FILE"
+  fi
+  exit 78
+}
+
+# ── Jiva config / binary ─────────────────────────────────────
+[ -f "$JIVA_CONFIG_FILE" ] || die "jiva config file not found: $JIVA_CONFIG_FILE"
+[ -s "$JIVA_CONFIG_FILE" ] || die "jiva config file is empty: $JIVA_CONFIG_FILE"
+[ -x "$JIVA_BIN" ] || die "jiva binary not executable: $JIVA_BIN"
+[ -f "$JOB_DIR/prompt.md" ] || die "prompt not found: $JOB_DIR/prompt.md"
+PROMPT_TEXT="$(cat "$JOB_DIR/prompt.md")"
+[ -n "${PROMPT_TEXT//[[:space:]]/}" ] || die "prompt.md is empty: $JOB_DIR/prompt.md"
+
+# ── Lock (§9.5 — no flock on macOS; mkdir is atomic) ─────────
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo $$ >"$LOCK_DIR/pid"
+    OWN_LOCK=1
+    return 0
+  fi
+  local holder=""
+  [ -f "$LOCK_DIR/pid" ] && holder="$(head -1 "$LOCK_DIR/pid" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    return 1
+  fi
+  rm -rf "$LOCK_DIR" 2>/dev/null
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo $$ >"$LOCK_DIR/pid"
+    if [ "$(head -1 "$LOCK_DIR/pid" 2>/dev/null | tr -d '[:space:]')" = "$$" ]; then
+      OWN_LOCK=1
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# ── Log paths — one timestamp, so .log and .result.json can't straddle a
+#    second boundary and end up with mismatched names. Local time, not UTC.
+STAMP_DATE="$(date '+%Y-%m-%d')"
+STAMP_TIME="$(date '+%H-%M-%S')"
+LOG_DIR="$JOB_DIR/logs/$STAMP_DATE"
+mkdir -p "$LOG_DIR" || die "cannot create log dir: $LOG_DIR"
+LOG_FILE="$LOG_DIR/$STAMP_TIME.log"
+RESULT_FILE="${LOG_FILE%.log}.result.json"
+
+if ! acquire_lock; then
+  HOLDER="$(head -1 "$LOCK_DIR/pid" 2>/dev/null | tr -d '[:space:]')"
+  printf '[%s] SKIPPED: already running (pid %s), lock %s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${HOLDER:-unknown}" "$LOCK_DIR" >>"$LOG_FILE"
+  [ -t 1 ] && printf 'SKIPPED: %s already running (pid %s)\n' "$JOB_NAME" "${HOLDER:-unknown}"
+  exit 0
+fi
+
+# ── Repo / workspace ─────────────────────────────────────────
+[ -d "$REPO_DIR" ] || die "REPO_DIR does not exist: $REPO_DIR"
+GIT_BRANCH="$(cd "$REPO_DIR" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+GIT_SHA="$(cd "$REPO_DIR" 2>/dev/null && git rev-parse --short HEAD 2>/dev/null)"
+GIT_DIRTY=""
+if [ -n "$(cd "$REPO_DIR" 2>/dev/null && git status --porcelain 2>/dev/null)" ]; then
+  GIT_DIRTY=" (dirty)"
+fi
+JIVA_VERSION="$("$JIVA_BIN" --version 2>/dev/null | head -1)"
+
+# ── Header — this is what makes a six-month-old log interpretable ─────
+START_ISO="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+START_EPOCH="$(date '+%s')"
+{
+  echo "═══════════════════════════════════════════════════════════════"
+  echo " job          : $JOB_NAME"
+  echo " runner       : jiva"
+  echo " started      : $START_ISO"
+  echo " max iters    : $JIVA_MAX_ITERATIONS"
+  echo " timeout      : ${TIMEOUT_SECONDS}s"
+  echo " workspace    : $REPO_DIR"
+  echo " git          : ${GIT_BRANCH:-?} @ ${GIT_SHA:-?}${GIT_DIRTY}"
+  echo " jiva         : ${JIVA_VERSION:-?} ($JIVA_BIN)"
+  echo " jiva config  : $JIVA_CONFIG_FILE"
+  echo " directive    : ${JIVA_DIRECTIVE_FILE:-<auto-discover>}"
+  echo " PATH         : $PATH"
+  echo " log          : $LOG_FILE"
+  echo "═══════════════════════════════════════════════════════════════"
+} >>"$LOG_FILE"
+[ -t 1 ] && sed -n '1,14p' "$LOG_FILE"
+
+# Running *inside* the workspace mirrors Claude Code's own "cd into REPO_DIR"
+# behaviour, even though --workspace is what Jiva actually reads.
+cd "$REPO_DIR" || die "cannot cd to REPO_DIR: $REPO_DIR"
+
+# ── Build the argv ───────────────────────────────────────────
+JIVA_ARGS=(
+  run "$PROMPT_TEXT"
+  --code
+  --workspace "$REPO_DIR"
+  --max-iterations "$JIVA_MAX_ITERATIONS"
+  --config "$JIVA_CONFIG_FILE"
+)
+[ -n "$JIVA_DIRECTIVE_FILE" ] && JIVA_ARGS+=(--directive "$JIVA_DIRECTIVE_FILE")
+
+say ""
+say "──── invoking jiva ────"
+
+# No separate JSON result stream to capture the way Claude has — Jiva prints
+# markdown content plus a couple of summary log lines straight to stdout/
+# stderr, so both are merged directly into the log; a result.json is
+# synthesized afterward from what we can parse out of it.
+"$JIVA_BIN" "${JIVA_ARGS[@]}" >>"$LOG_FILE" 2>&1 </dev/null &
+JIVA_PID=$!
+
+# ── Watchdog (macOS has no timeout(1)) ────────────────────────
+WATCHDOG_PID=""
+if [ "$TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null; then
+  (
+    slept=0
+    while [ "$slept" -lt "$TIMEOUT_SECONDS" ]; do
+      kill -0 "$JIVA_PID" 2>/dev/null || exit 0
+      sleep 5
+      slept=$((slept + 5))
+    done
+    if kill -0 "$JIVA_PID" 2>/dev/null; then
+      : >"$KILL_MARKER"
+      kill -TERM "$JIVA_PID" 2>/dev/null
+      sleep 10
+      kill -KILL "$JIVA_PID" 2>/dev/null
+    fi
+  ) &
+  WATCHDOG_PID=$!
+fi
+
+wait "$JIVA_PID" 2>/dev/null
+EXIT_CODE=$?
+if [ -n "$WATCHDOG_PID" ]; then
+  { kill "$WATCHDOG_PID" && wait "$WATCHDOG_PID"; } 2>/dev/null
+fi
+KILLED=0
+[ -f "$KILL_MARKER" ] && KILLED=1
+
+END_EPOCH="$(date '+%s')"
+DURATION=$((END_EPOCH - START_EPOCH))
+
+# ── Footer. Parse the just-captured log text for Jiva's own summary lines
+#    (no JSON result to parse here, unlike Claude) and write the SAME footer
+#    key set cjob/cjob-web already understand, so no log/usage-parsing code
+#    needs to change for this runner. ─────────
+python3 - "$LOG_FILE" "$RESULT_FILE" "$EXIT_CODE" "$DURATION" "$KILLED" "$START_ISO" \
+  "$JOB_NAME" "$JIVA_MAX_ITERATIONS" "$REPO_DIR" "${GIT_BRANCH:-}" "${GIT_SHA:-}" \
+  "$JIVA_INPUT_PRICE_PER_1M" "$JIVA_OUTPUT_PRICE_PER_1M" <<'PY'
+import json, re, sys, os
+
+(log_file, result_file, exit_code, duration, killed, started, job, max_iters,
+ repo, branch, sha, input_price, output_price) = sys.argv[1:14]
+exit_code, duration, killed = int(exit_code), int(duration), int(killed)
+
+try:
+    with open(log_file, errors="replace") as fh:
+        text = fh.read()
+except OSError:
+    text = ""
+
+m_iters = re.search(r"Completed in (\d+) iteration\(s\)", text)
+m_tools = re.search(r"Tools used: (.+)", text)
+m_tokens = re.search(r"Token usage: prompt=(\d+) completion=(\d+) total=(\d+)", text)
+
+iterations = int(m_iters.group(1)) if m_iters else None
+tools_used = [t.strip() for t in m_tools.group(1).split(",")] if m_tools else []
+token_usage = None
+if m_tokens:
+    token_usage = {
+        "promptTokens": int(m_tokens.group(1)),
+        "completionTokens": int(m_tokens.group(2)),
+        "totalTokens": int(m_tokens.group(3)),
+    }
+
+def to_price(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+price_in, price_out = to_price(input_price), to_price(output_price)
+cost = None
+if token_usage and price_in is not None and price_out is not None:
+    cost = (token_usage["promptTokens"] / 1_000_000.0) * price_in \
+        + (token_usage["completionTokens"] / 1_000_000.0) * price_out
+
+is_error = bool(exit_code != 0)
+if killed:
+    is_error = True
+
+summary = {
+    "runner": "jiva",
+    "job": job,
+    "started": started,
+    "exit_code": exit_code,
+    "duration_seconds": duration,
+    "killed_by_watchdog": bool(killed),
+    "is_error": is_error,
+    "num_turns": iterations,
+    "total_cost_usd": cost,
+    "session_id": None,
+    "tools_used": tools_used,
+    "token_usage": token_usage,
+    "max_iterations": int(max_iters) if max_iters.isdigit() else None,
+    "repo": repo,
+    "git_branch": branch,
+    "git_sha": sha,
+    "log": log_file,
+    "result": result_file,
+}
+
+why = "exited on its own"
+if killed:
+    why = "KILLED BY WATCHDOG (wall-clock timeout)"
+elif exit_code < 0 or exit_code > 128:
+    why = "terminated by signal %d" % (exit_code - 128)
+
+cost_s = "n/a" if cost is None else ("%.4f" % cost)
+
+out = []
+out.append("")
+out.append("──── final message ────")
+# Best-effort: everything after the last summary/log line and before the
+# footer is Jiva's own formatted markdown reply; since it's already in the
+# log verbatim (not re-printed here), this section just marks where to look.
+out.append("(see the invocation output above — Jiva's reply is inline, not")
+out.append(" duplicated into a separate result blob the way Claude's is)")
+
+out.append("")
+out.append("──── result json ────")
+out.append(json.dumps(summary, indent=2, sort_keys=True))
+
+out.append("")
+out.append("──────────────────────── RUN FOOTER ────────────────────────")
+out.append("cjob.exit_code=%d" % exit_code)
+out.append("cjob.duration_seconds=%d" % duration)
+out.append("cjob.killed_by_watchdog=%s" % ("yes" if killed else "no"))
+out.append("cjob.termination=%s" % why)
+out.append("cjob.is_error=%s" % ("true" if is_error else "false"))
+out.append("cjob.num_turns=%s" % ("" if iterations is None else iterations))
+out.append("cjob.total_cost_usd=%s" % ("" if cost is None else cost))
+out.append("cjob.session_id=")
+out.append("cjob.subtype=%s" % ("success" if not is_error else "error"))
+out.append("cjob.terminal_reason=%s" % why)
+out.append("cjob.finished=%s" % __import__("time").strftime("%Y-%m-%dT%H:%M:%S%z"))
+out.append("──────────────────────── END FOOTER ────────────────────────")
+out.append("%s in %ds — %s | turns=%s | est. cost $%s%s" % (
+    "FAILED" if is_error else "OK",
+    duration, why,
+    "?" if iterations is None else iterations,
+    cost_s,
+    "" if not tools_used else " | tools %s" % ", ".join(tools_used),
+))
+
+blob = "\n".join(out) + "\n"
+with open(log_file, "a") as fh:
+    fh.write(blob)
+
+tmp = result_file + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(summary, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+os.replace(tmp, result_file)
+
+if sys.stdout.isatty():
+    sys.stdout.write("\n".join(out[-16:]) + "\n")
+PY
+
+# ── Retention ────────────────────────────────────────────────
+if [ "$LOG_RETENTION_DAYS" -gt 0 ] 2>/dev/null; then
+  python3 - "$JOB_DIR/logs" "$LOG_RETENTION_DAYS" "$LOG_FILE" <<'PY'
+import datetime, os, shutil, sys
+root, days, log_file = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+cutoff = datetime.date.today() - datetime.timedelta(days=days)
+removed = []
+try:
+    names = sorted(os.listdir(root))
+except OSError:
+    names = []
+for name in names:
+    path = os.path.join(root, name)
+    if not os.path.isdir(path):
+        continue
+    try:
+        day = datetime.datetime.strptime(name, "%Y-%m-%d").date()
+    except ValueError:
+        continue
+    if day < cutoff:
+        shutil.rmtree(path, ignore_errors=True)
+        removed.append(name)
+if removed:
+    with open(log_file, "a") as fh:
+        fh.write("pruned log dirs older than %d days: %s\n" % (days, ", ".join(removed)))
+PY
+fi
+
+exit "$EXIT_CODE"

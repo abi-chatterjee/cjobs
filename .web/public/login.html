@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>cjob — sign in</title>
+<link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+<div class="login-wrap">
+  <div class="card login-card">
+    <div class="brand">⏱ cjob</div>
+    <div class="tagline">scheduled Claude Code jobs</div>
+    <div id="banner"></div>
+    <form id="login-form">
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password" autofocus required />
+      </div>
+      <button type="submit" class="primary" style="width:100%; justify-content:center;" id="submit-btn">Sign in</button>
+    </form>
+    <div id="setup-hint" class="field hint" style="display:none; margin-top:14px;"></div>
+  </div>
+</div>
+<script type="module">
+  const banner = document.getElementById("banner");
+  const form = document.getElementById("login-form");
+  const submitBtn = document.getElementById("submit-btn");
+  const setupHint = document.getElementById("setup-hint");
+
+  function showBanner(msg, kind) {
+    banner.innerHTML = `<div class="banner ${kind}">${msg}</div>`;
+  }
+
+  fetch("/api/auth/status").then(r => r.json()).then(d => {
+    if (d.authenticated) {
+      window.location.href = "/";
+    } else if (d.needsSetup) {
+      setupHint.style.display = "block";
+      setupHint.textContent = "No password is configured yet. On the server machine, run: node setup-password.js";
+    }
+  }).catch(() => {});
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    banner.innerHTML = "";
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Signing in…";
+    try {
+      const password = document.getElementById("password").value;
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showBanner(data.error || "sign in failed", "error");
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Sign in";
+        return;
+      }
+      window.location.href = "/";
+    } catch (err) {
+      showBanner("network error — is the server running?", "error");
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Sign in";
+    }
+  });
+</script>
+</body>
+</html>
